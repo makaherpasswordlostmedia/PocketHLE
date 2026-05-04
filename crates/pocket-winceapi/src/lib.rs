@@ -175,6 +175,7 @@ impl Dispatcher for WinCeDispatcher {
             let (ret, status) = match &outcome {
                 Ok(DispatchOutcome::ReturnedR0(v)) => (*v, "ok"),
                 Ok(DispatchOutcome::ReturnedR0R1(v, _)) => (*v, "ok"),
+                Ok(DispatchOutcome::Trampoline { target, .. }) => (*target, "trampoline"),
                 Ok(DispatchOutcome::Halt) => (0, "halt"),
                 Ok(DispatchOutcome::Unimplemented) => (0, "unimplemented"),
                 Err(_) => (0, "error"),

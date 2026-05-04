@@ -71,6 +71,14 @@ enum Command {
         #[arg(long)]
         frame_png: Option<PathBuf>,
     },
+    /// Render a built-in self-test pattern through the same GDI/GAPI
+    /// rasteriser the run loop uses, then dump it as a PNG. This is
+    /// useful for verifying the framebuffer pipeline end-to-end
+    /// without needing a real game binary.
+    DemoFrame {
+        /// Output PNG path.
+        out: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -115,7 +123,58 @@ fn main() -> Result<()> {
             &rom_prefix,
             frame_png.as_deref(),
         ),
+        Command::DemoFrame { out } => cmd_demo_frame(&out),
     }
+}
+
+fn cmd_demo_frame(out: &std::path::Path) -> Result<()> {
+    use pocket_core::kernel::{Framebuffer, FB_HEIGHT, FB_WIDTH};
+    let mut fb = Framebuffer::new(FB_WIDTH, FB_HEIGHT);
+    // Sky gradient.
+    let h = FB_HEIGHT as i32;
+    let w = FB_WIDTH as i32;
+    for y in 0..h {
+        let t = y as f32 / h as f32;
+        let r = (0x33 as f32 * (1.0 - t) + 0x10 as f32 * t) as u8;
+        let g = (0x88 as f32 * (1.0 - t) + 0x40 as f32 * t) as u8;
+        let b = (0xee as f32 * (1.0 - t) + 0xa0 as f32 * t) as u8;
+        fb.fill_rect(0, y, w, y + 1, [r, g, b, 0xff]);
+    }
+    // Ground.
+    fb.fill_rect(0, h - 56, w, h, [0x4a, 0x88, 0x40, 0xff]);
+    // Yellow ball.
+    let cx = w / 2;
+    let cy = h - 56 - 28;
+    let radius = 28i32;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dy * dy <= radius * radius {
+                fb.put_pixel(cx + dx, cy + dy, [0xff, 0xd5, 0x33, 0xff]);
+            }
+        }
+    }
+    // Eye.
+    for dy in -3..=3 {
+        for dx in -3..=3 {
+            if dx * dx + dy * dy <= 9 {
+                fb.put_pixel(cx + 8 + dx, cy - 8 + dy, [0x10, 0x10, 0x10, 0xff]);
+            }
+        }
+    }
+    // Title bar.
+    fb.fill_rect(0, 0, w, 18, [0x14, 0x18, 0x24, 0xff]);
+    fb.stroke_rect(0, 0, w, 18, [0xff, 0xff, 0xff, 0xff]);
+    // Frame border.
+    fb.stroke_rect(0, 0, w, h, [0xff, 0xff, 0xff, 0xff]);
+    fb.write_png(out)
+        .with_context(|| format!("writing PNG to {}", out.display()))?;
+    println!(
+        "Demo frame written to {} ({}x{} RGBA)",
+        out.display(),
+        FB_WIDTH,
+        FB_HEIGHT
+    );
+    Ok(())
 }
 
 fn cmd_pe_info(path: &std::path::Path) -> Result<()> {

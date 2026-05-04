@@ -128,7 +128,7 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "ShowWindow", one_returning);
     d.register_handler(dll, "UpdateWindow", one_returning);
     d.register_handler(dll, "DefWindowProcW", zero_returning);
-    d.register_handler(dll, "DispatchMessageW", zero_returning);
+    d.register_handler(dll, "DispatchMessageW", dispatch_message_w);
     d.register_handler(dll, "GetMessageW", get_message_w);
     d.register_handler(dll, "PeekMessageW", zero_returning);
     d.register_handler(dll, "TranslateMessage", one_returning);
@@ -896,7 +896,19 @@ fn do_realloc(
 
 // ---------- window / message ----------
 
-fn register_class_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+fn register_class_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // WNDCLASSW { UINT style; WNDPROC lpfnWndProc; ... }
+    // Capture lpfnWndProc so DispatchMessageW can re-enter it.
+    let p = ctx.arg_u32(0)?;
+    if p != 0 {
+        if let Ok(bytes) = ctx.cpu.read_mem(p + 4, 4) {
+            let proc_va = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            if proc_va != 0 {
+                ctx.kernel.wnd_proc = proc_va;
+                log::info!("RegisterClassW: lpfnWndProc=0x{proc_va:08x}");
+            }
+        }
+    }
     // ATOMs are 16-bit; return a non-zero one.
     Ok(DispatchOutcome::ReturnedR0(0xC001))
 }
@@ -905,23 +917,61 @@ fn create_window_ex_w(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelE
     Ok(DispatchOutcome::ReturnedR0(FAKE_HWND))
 }
 
+// Standard Windows message numbers we synthesise.
+const WM_QUIT: u32 = 0x0012;
+const WM_PAINT: u32 = 0x000F;
+
 /// `BOOL GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax)`
 ///
-/// We have no real message queue. We answer with a single `WM_QUIT`
-/// after the first call — that gracefully tears down the message loop
-/// in any well-written WinCE app and gives us a clean exit.
+/// We have no real Win32 message queue. We synthesise enough messages
+/// to drive the game through one paint cycle: first `WM_PAINT` (so
+/// the WndProc actually rasters into our framebuffer), then `WM_QUIT`
+/// to tear down the loop. The counter lives in `KernelState.heap`'s
+/// stats are not the right place — instead we use a per-process
+/// counter encoded in the WndProc field's high bit.
 fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let lp_msg = ctx.arg_u32(0)?;
+    let phase = ctx.kernel.message_phase;
+    let (msg_id, ret) = match phase {
+        0 if ctx.kernel.wnd_proc != 0 => (WM_PAINT, 1u32),
+        _ => (WM_QUIT, 0u32),
+    };
+    ctx.kernel.message_phase = phase.saturating_add(1);
     if lp_msg != 0 {
         // MSG layout: HWND hwnd; UINT message; WPARAM wParam; LPARAM lParam;
         // DWORD time; POINT pt; -- 28 bytes total on 32-bit.
         let mut msg = [0u8; 28];
-        // message field at offset 4 = WM_QUIT (0x12)
-        msg[4..8].copy_from_slice(&0x0012u32.to_le_bytes());
+        msg[0..4].copy_from_slice(&FAKE_HWND.to_le_bytes());
+        msg[4..8].copy_from_slice(&msg_id.to_le_bytes());
         ctx.cpu.write_mem(lp_msg, &msg)?;
     }
-    // Returning 0 tells the loop to terminate, which is what WM_QUIT does.
-    Ok(DispatchOutcome::ReturnedR0(0))
+    log::trace!("GetMessageW -> msg=0x{msg_id:04x} ret={ret}");
+    Ok(DispatchOutcome::ReturnedR0(ret))
+}
+
+/// `LRESULT DispatchMessageW(const MSG *lpMsg)` — re-enter the
+/// previously registered WNDPROC with `(hwnd, message, wParam, lParam)`.
+/// The trampoline outcome makes the kernel jump there with LR set to
+/// our trampoline-return sentinel.
+fn dispatch_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let lp_msg = ctx.arg_u32(0)?;
+    let target = ctx.kernel.wnd_proc;
+    if lp_msg == 0 || target == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = ctx.cpu.read_mem(lp_msg, 16)?;
+    let hwnd = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let msg = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let wparam = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let lparam = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    log::info!(
+        "DispatchMessageW -> WndProc(0x{hwnd:08x}, 0x{msg:04x}, 0x{wparam:08x}, 0x{lparam:08x})"
+    );
+    Ok(DispatchOutcome::Trampoline {
+        target,
+        lr: pocket_kernel::TRAMPOLINE_RETURN_VA,
+        args: [hwnd, msg, wparam, lparam],
+    })
 }
 
 fn post_quit_message(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
@@ -1042,6 +1092,8 @@ mod tests {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
             fb: Framebuffer::new(240, 320),
+            wnd_proc: 0,
+            message_phase: 0,
         }
     }
 

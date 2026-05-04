@@ -93,6 +93,18 @@ pub enum DispatchOutcome {
     /// The host has not implemented this API. PocketHLE will log a
     /// loud warning and synthesize a `0` return.
     Unimplemented,
+    /// Trampoline guest execution into another guest function (e.g.
+    /// `DispatchMessageW` re-entering the registered `WndProc`).
+    /// `target` becomes the next PC; `lr` is loaded into LR so the
+    /// callee returns to a synthesised stub address. `args` is loaded
+    /// into R0..R3 in order. The dispatcher loop does not synthesise
+    /// an R0 return value when this variant is used — the real R0
+    /// will be whatever the callee leaves there.
+    Trampoline {
+        target: u32,
+        lr: u32,
+        args: [u32; 4],
+    },
 }
 
 /// Trait an API layer registers with the kernel. Called every time
@@ -114,7 +126,19 @@ pub struct KernelState {
     pub heap: Heap,
     pub vfs: vfs::Vfs,
     pub fb: Framebuffer,
+    /// Address of the last `WNDPROC` registered through
+    /// `RegisterClassW`. Used by `DispatchMessageW` to re-enter the
+    /// guest paint handler. `0` means "no class registered yet".
+    pub wnd_proc: u32,
+    /// Counter for the synthetic `GetMessageW` queue: 0 → WM_PAINT,
+    /// 1+ → WM_QUIT. Lets us drive a single paint cycle.
+    pub message_phase: u32,
 }
+
+/// Synthetic LR address `DispatchMessageW` uses when trampolining
+/// into a `WNDPROC`. Hitting this address ends the inner emulation
+/// and returns control to the dispatcher loop.
+pub const TRAMPOLINE_RETURN_VA: u32 = 0x7E00_0000;
 
 /// Software framebuffer backing GDI and GAPI rendering.
 ///
@@ -447,6 +471,15 @@ impl Process {
         // 6. Map the 240x320 RGB565 framebuffer GAPI hands the game.
         cpu.map_region(FRAMEBUFFER_BASE, FRAMEBUFFER_SIZE, Prot::READ | Prot::WRITE)?;
 
+        // 7. Map a one-page trampoline-return stub. When the
+        //    dispatcher trampolines guest code into a WNDPROC it
+        //    sets LR to this address; the page is filled with bx lr
+        //    and the run loop installs a code hook so we land back
+        //    in the dispatcher with whatever R0 the WNDPROC returned.
+        cpu.map_region(TRAMPOLINE_RETURN_VA, 0x1000, Prot::READ | Prot::EXEC)?;
+        cpu.write_mem(TRAMPOLINE_RETURN_VA, &ARM_BX_LR)?;
+        cpu.add_code_hook(TRAMPOLINE_RETURN_VA)?;
+
         Ok(Process {
             image,
             thunks,
@@ -457,6 +490,8 @@ impl Process {
                 heap,
                 vfs: vfs::Vfs::new(),
                 fb: Framebuffer::new(FB_WIDTH, FB_HEIGHT),
+                wnd_proc: 0,
+                message_phase: 0,
             },
         })
     }
@@ -515,6 +550,15 @@ pub fn run_main_loop(
                 continue;
             }
             StopReason::Hook(addr) => {
+                // The trampoline-return sentinel is never an IAT
+                // thunk; treat it as "the inner WndProc returned —
+                // resume the outer call site".
+                if addr == TRAMPOLINE_RETURN_VA {
+                    let lr = cpu.read_reg(ArmReg::Lr)?;
+                    log::trace!("trampoline return; resuming at lr=0x{lr:08x}");
+                    pc = lr & !1;
+                    continue;
+                }
                 let thunk = {
                     let t = process.find_thunk(addr).ok_or_else(|| {
                         KernelError::Dispatch(format!("hook fired at unmapped 0x{addr:08x}"))
@@ -530,6 +574,16 @@ pub fn run_main_loop(
                     DispatchOutcome::ReturnedR0(v) => Some((v, None)),
                     DispatchOutcome::ReturnedR0R1(a, b) => Some((a, Some(b))),
                     DispatchOutcome::Unimplemented => Some((0, None)),
+                    DispatchOutcome::Trampoline { target, lr, args } => {
+                        cpu.write_reg(ArmReg::R0, args[0])?;
+                        cpu.write_reg(ArmReg::R1, args[1])?;
+                        cpu.write_reg(ArmReg::R2, args[2])?;
+                        cpu.write_reg(ArmReg::R3, args[3])?;
+                        cpu.write_reg(ArmReg::Lr, lr)?;
+                        log::trace!("trampoline -> 0x{target:08x} lr=0x{lr:08x} args={args:?}");
+                        pc = target & !1;
+                        continue;
+                    }
                 };
                 if let Some((v, maybe_hi)) = r0_default {
                     cpu.write_reg(ArmReg::R0, v)?;
