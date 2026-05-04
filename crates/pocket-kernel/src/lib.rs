@@ -56,6 +56,18 @@ pub const KERNEL_TRAP_SIZE: u32 = 0x0001_0000;
 pub const HEAP_BASE: u32 = 0x5000_0000;
 pub const HEAP_SIZE: u32 = 0x0100_0000;
 
+/// Base of the GAPI / GDI framebuffer the guest writes pixels into.
+/// Pocket PC's GAPI exposes a 240×320 16-bit RGB565 surface. We map
+/// 256 KiB at this VA so that `?GXBeginDraw@@YAPAXXZ` can return a
+/// real pointer the game is allowed to write to, and so GDI handlers
+/// (BeginPaint / Rectangle / FillRect) have a backing surface to
+/// rasterise into.
+pub const FRAMEBUFFER_BASE: u32 = 0x7800_0000;
+pub const FRAMEBUFFER_SIZE: u32 = 0x0004_0000;
+pub const FB_WIDTH: u32 = 240;
+pub const FB_HEIGHT: u32 = 320;
+pub const FB_BPP: u32 = 16;
+
 /// "bx lr" in ARM mode (little endian).
 pub const ARM_BX_LR: [u8; 4] = [0x1e, 0xff, 0x2f, 0xe1];
 
@@ -101,6 +113,130 @@ pub trait Dispatcher {
 pub struct KernelState {
     pub heap: Heap,
     pub vfs: vfs::Vfs,
+    pub fb: Framebuffer,
+}
+
+/// Software framebuffer backing GDI and GAPI rendering.
+///
+/// We keep two parallel buffers: the *guest* RGB565 buffer that lives
+/// inside CPU memory at [`FRAMEBUFFER_BASE`] (which the game writes to
+/// via GAPI), and a host-side RGBA8888 mirror that GDI handlers
+/// (BeginPaint / Rectangle / FillRect / TextOutW) rasterise into.
+///
+/// `present_from_guest` is called by `?GXEndDraw@@YAHXZ` and copies
+/// the guest's RGB565 over into the RGBA mirror.
+///
+/// `to_png` writes the RGBA mirror to a PNG file using the `png`
+/// crate.
+#[derive(Debug)]
+pub struct Framebuffer {
+    pub width: u32,
+    pub height: u32,
+    /// Host-side RGBA8888 mirror, `width * height * 4` bytes.
+    pub rgba: Vec<u8>,
+}
+
+impl Framebuffer {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            rgba: vec![0; (width * height * 4) as usize],
+        }
+    }
+
+    /// Returns the byte offset into `rgba` for `(x, y)`, or `None`
+    /// if out of bounds.
+    fn idx(&self, x: i32, y: i32) -> Option<usize> {
+        if x < 0 || y < 0 {
+            return None;
+        }
+        let (x, y) = (x as u32, y as u32);
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        Some(((y * self.width + x) * 4) as usize)
+    }
+
+    pub fn put_pixel(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
+        if let Some(i) = self.idx(x, y) {
+            self.rgba[i..i + 4].copy_from_slice(&rgba);
+        }
+    }
+
+    pub fn fill_rect(&mut self, l: i32, t: i32, r: i32, b: i32, rgba: [u8; 4]) {
+        let (l, r) = (l.min(r), l.max(r));
+        let (t, b) = (t.min(b), t.max(b));
+        for y in t..b {
+            for x in l..r {
+                self.put_pixel(x, y, rgba);
+            }
+        }
+    }
+
+    /// Stroke an outline rectangle (used by GDI `Rectangle`).
+    pub fn stroke_rect(&mut self, l: i32, t: i32, r: i32, b: i32, rgba: [u8; 4]) {
+        let (l, r) = (l.min(r), l.max(r));
+        let (t, b) = (t.min(b), t.max(b));
+        for x in l..r {
+            self.put_pixel(x, t, rgba);
+            self.put_pixel(x, b - 1, rgba);
+        }
+        for y in t..b {
+            self.put_pixel(l, y, rgba);
+            self.put_pixel(r - 1, y, rgba);
+        }
+    }
+
+    /// Convert RGB565 little-endian bytes from the guest into our
+    /// RGBA mirror. `pitch_bytes` is the row pitch in bytes; default
+    /// is `width * 2`.
+    pub fn present_from_rgb565(&mut self, rgb565: &[u8], pitch_bytes: usize) {
+        let pitch = if pitch_bytes == 0 {
+            (self.width * 2) as usize
+        } else {
+            pitch_bytes
+        };
+        for y in 0..self.height as usize {
+            let row = y * pitch;
+            for x in 0..self.width as usize {
+                let off = row + x * 2;
+                if off + 1 >= rgb565.len() {
+                    break;
+                }
+                let lo = rgb565[off];
+                let hi = rgb565[off + 1];
+                let v = u16::from_le_bytes([lo, hi]);
+                let r5 = ((v >> 11) & 0x1f) as u8;
+                let g6 = ((v >> 5) & 0x3f) as u8;
+                let b5 = (v & 0x1f) as u8;
+                let r = (r5 << 3) | (r5 >> 2);
+                let g = (g6 << 2) | (g6 >> 4);
+                let b = (b5 << 3) | (b5 >> 2);
+                let i = (y * self.width as usize + x) * 4;
+                self.rgba[i] = r;
+                self.rgba[i + 1] = g;
+                self.rgba[i + 2] = b;
+                self.rgba[i + 3] = 0xff;
+            }
+        }
+    }
+
+    /// Write the RGBA framebuffer to a PNG file.
+    pub fn write_png(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let w = std::io::BufWriter::new(file);
+        let mut enc = png::Encoder::new(w, self.width, self.height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc
+            .write_header()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        writer
+            .write_image_data(&self.rgba)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// One IAT entry that has been resolved to a host-side stub.
@@ -308,6 +444,9 @@ impl Process {
         }
         cpu.write_mem(KERNEL_TRAP_BASE, &trap_page)?;
 
+        // 6. Map the 240x320 RGB565 framebuffer GAPI hands the game.
+        cpu.map_region(FRAMEBUFFER_BASE, FRAMEBUFFER_SIZE, Prot::READ | Prot::WRITE)?;
+
         Ok(Process {
             image,
             thunks,
@@ -317,6 +456,7 @@ impl Process {
             state: KernelState {
                 heap,
                 vfs: vfs::Vfs::new(),
+                fb: Framebuffer::new(FB_WIDTH, FB_HEIGHT),
             },
         })
     }
@@ -370,8 +510,8 @@ pub fn run_main_loop(
         };
         match stop {
             StopReason::InstructionLimit => {
-                log::trace!("instruction slice exhausted; resuming");
                 pc = cpu.read_reg(ArmReg::Pc)?;
+                log::trace!("instruction slice exhausted; resume pc=0x{pc:08x}");
                 continue;
             }
             StopReason::Hook(addr) => {
@@ -466,5 +606,35 @@ mod tests {
         let mut cpu = StubCpu::new();
         let p = Process::map_into(img, &mut cpu, &|_, _| None).unwrap();
         assert_eq!(p.image.entry_va(), 0x11000);
+    }
+
+    #[test]
+    fn framebuffer_fill_and_present() {
+        let mut fb = Framebuffer::new(4, 2);
+        fb.fill_rect(0, 0, 2, 2, [0xff, 0x00, 0x00, 0xff]);
+        // Pixel (0,0) red, (3,0) untouched.
+        assert_eq!(&fb.rgba[0..4], &[0xff, 0x00, 0x00, 0xff]);
+        assert_eq!(&fb.rgba[12..16], &[0x00, 0x00, 0x00, 0x00]);
+
+        // RGB565 0xF800 = pure red. Build 4*2 px row-major.
+        let mut rgb565 = vec![];
+        for _ in 0..(4 * 2) {
+            rgb565.extend_from_slice(&0xF800u16.to_le_bytes());
+        }
+        fb.present_from_rgb565(&rgb565, 0);
+        assert_eq!(&fb.rgba[0..4], &[0xff, 0x00, 0x00, 0xff]);
+        assert_eq!(&fb.rgba[12..16], &[0xff, 0x00, 0x00, 0xff]);
+    }
+
+    #[test]
+    fn framebuffer_writes_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame.png");
+        let mut fb = Framebuffer::new(8, 8);
+        fb.fill_rect(0, 0, 4, 4, [0x10, 0x80, 0xff, 0xff]);
+        fb.write_png(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        // PNG magic header.
+        assert_eq!(&bytes[0..8], b"\x89PNG\r\n\x1a\n");
     }
 }

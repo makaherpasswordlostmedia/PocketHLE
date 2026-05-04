@@ -66,6 +66,10 @@ enum Command {
         /// of `\Application\` (e.g. `--rom-prefix \\Storage\\`).
         #[arg(long, default_value = "\\Application\\")]
         rom_prefix: String,
+        /// After the run finishes, dump the host-visible RGBA8888
+        /// mirror of the guest framebuffer to a PNG file.
+        #[arg(long)]
+        frame_png: Option<PathBuf>,
     },
 }
 
@@ -99,6 +103,7 @@ fn main() -> Result<()> {
             trace_json,
             rom_dir,
             rom_prefix,
+            frame_png,
         } => cmd_run(
             &path,
             cpu,
@@ -108,6 +113,7 @@ fn main() -> Result<()> {
             trace_json.as_deref(),
             rom_dir.as_deref(),
             &rom_prefix,
+            frame_png.as_deref(),
         ),
     }
 }
@@ -219,6 +225,7 @@ fn cmd_run(
     trace_json: Option<&std::path::Path>,
     rom_dir: Option<&std::path::Path>,
     rom_prefix: &str,
+    frame_png: Option<&std::path::Path>,
 ) -> Result<()> {
     let mut emu = match backend {
         CpuBackend::Stub => Emulator::with_stub_cpu(),
@@ -257,7 +264,12 @@ fn cmd_run(
         "Registered API stubs: {}",
         emu.dispatcher().registered_count()
     );
-    emu.run()?;
+    let run_result = emu.run();
+    if let Some(png) = frame_png {
+        emu.write_framebuffer_png(png)?;
+        println!("Wrote framebuffer snapshot to {}", png.display());
+    }
+    run_result?;
     println!("Emulator exited cleanly.");
     Ok(())
 }

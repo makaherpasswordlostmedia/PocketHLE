@@ -6,18 +6,19 @@
 //! "success" plus a synthetic `GXDisplayProperties` record so games
 //! see a 240x320, 16 bits-per-pixel landscape device.
 
-use pocket_kernel::{DispatchOutcome, KernelError};
+use pocket_kernel::{DispatchOutcome, KernelError, FB_BPP, FB_HEIGHT, FB_WIDTH, FRAMEBUFFER_BASE};
 
 use crate::{CallCtx, WinCeDispatcher};
 
-/// Synthetic framebuffer base address. Mapped lazily by the
-/// dispatcher on `GXBeginDraw`. The value is chosen well above the
-/// thunk pool so it cannot collide with normal allocations.
-pub const SYNTHETIC_FB_BASE: u32 = 0x7800_0000;
-pub const SCREEN_WIDTH: u32 = 240;
-pub const SCREEN_HEIGHT: u32 = 320;
+/// Synthetic framebuffer base address. Mapped by `Process::map_into`
+/// (see `pocket_kernel::FRAMEBUFFER_BASE`). The game writes 16-bit
+/// RGB565 pixels here; `GXEndDraw` snapshots them into the
+/// host-visible RGBA mirror inside `KernelState::fb`.
+pub const SYNTHETIC_FB_BASE: u32 = FRAMEBUFFER_BASE;
+pub const SCREEN_WIDTH: u32 = FB_WIDTH;
+pub const SCREEN_HEIGHT: u32 = FB_HEIGHT;
 /// 16 bpp framebuffer, default Pocket PC depth.
-pub const SCREEN_BPP: u32 = 16;
+pub const SCREEN_BPP: u32 = FB_BPP;
 
 pub fn register(d: &mut WinCeDispatcher) {
     let dll = "gx.dll";
@@ -57,7 +58,15 @@ fn gx_begin_draw(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError>
     Ok(DispatchOutcome::ReturnedR0(SYNTHETIC_FB_BASE))
 }
 
-fn gx_end_draw(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+fn gx_end_draw(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    // Snapshot guest RGB565 -> host RGBA on present.
+    let bytes_needed = SCREEN_WIDTH * SCREEN_HEIGHT * 2;
+    if let Ok(rgb565) = ctx.cpu.read_mem(SYNTHETIC_FB_BASE, bytes_needed) {
+        ctx.kernel
+            .fb
+            .present_from_rgb565(&rgb565, (SCREEN_WIDTH * 2) as usize);
+        log::trace!("GXEndDraw: presented {} bytes of RGB565", rgb565.len());
+    }
     Ok(DispatchOutcome::ReturnedR0(1))
 }
 

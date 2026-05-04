@@ -140,13 +140,10 @@ pub fn register(d: &mut WinCeDispatcher) {
 
     // ---- GDI ----
     for f in [
-        "BeginPaint",
-        "EndPaint",
         "GetDC",
         "ReleaseDC",
         "CreateCompatibleDC",
         "CreateCompatibleBitmap",
-        "CreateSolidBrush",
         "CreatePen",
         "CreateFontIndirectW",
         "GetStockObject",
@@ -154,11 +151,16 @@ pub fn register(d: &mut WinCeDispatcher) {
     ] {
         d.register_handler(dll, f, fake_gdi_handle);
     }
+    // BeginPaint / EndPaint return our screen-DC sentinel so the
+    // game's draw calls can be routed back into the framebuffer.
+    d.register_handler(dll, "BeginPaint", begin_paint);
+    d.register_handler(dll, "EndPaint", end_paint);
+    d.register_handler(dll, "CreateSolidBrush", create_solid_brush);
     d.register_handler(dll, "DeleteObject", one_returning);
     d.register_handler(dll, "DeleteDC", one_returning);
     d.register_handler(dll, "BitBlt", one_returning);
-    d.register_handler(dll, "Rectangle", one_returning);
-    d.register_handler(dll, "FillRect", one_returning);
+    d.register_handler(dll, "Rectangle", rectangle);
+    d.register_handler(dll, "FillRect", fill_rect);
     d.register_handler(dll, "SetBkMode", zero_returning);
     d.register_handler(dll, "SetBkColor", zero_returning);
     d.register_handler(dll, "SetTextColor", zero_returning);
@@ -939,17 +941,107 @@ fn get_system_metrics(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
     Ok(DispatchOutcome::ReturnedR0(v))
 }
 
+// ---------- GDI rasterisation ----------
+
+/// Sentinel HDC value our `BeginPaint` returns. Every GDI handler
+/// looks for this exact value before doing any rasterisation; that
+/// way handles produced by [`fake_gdi_handle`] (off-screen DCs the
+/// game sometimes creates for double-buffering) silently no-op.
+pub const SCREEN_DC: u32 = 0xDEAD_5C30;
+
+/// Tagged base for our fake brush handles. The low 24 bits hold the
+/// COLORREF the brush represents (0x00BBGGRR per the Win32 ABI).
+const BRUSH_TAG_BASE: u32 = 0xBB00_0000;
+const BRUSH_TAG_MASK: u32 = 0xFF00_0000;
+
+fn brush_color(handle: u32) -> Option<[u8; 4]> {
+    if handle & BRUSH_TAG_MASK != BRUSH_TAG_BASE {
+        return None;
+    }
+    let bb = ((handle >> 16) & 0xff) as u8;
+    let gg = ((handle >> 8) & 0xff) as u8;
+    let rr = (handle & 0xff) as u8;
+    Some([rr, gg, bb, 0xff])
+}
+
+fn create_solid_brush(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let cr = ctx.arg_u32(0)?;
+    let h = BRUSH_TAG_BASE | (cr & 0x00FF_FFFF);
+    Ok(DispatchOutcome::ReturnedR0(h))
+}
+
+/// `HDC BeginPaint(HWND, LPPAINTSTRUCT)`
+fn begin_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let ps = ctx.arg_u32(1)?;
+    if ps != 0 {
+        // PAINTSTRUCT layout (WinCE): HDC hdc; BOOL fErase; RECT rcPaint(4i32);
+        // BOOL fRestore; BOOL fIncUpdate; BYTE rgbReserved[32]; — pad to 64 bytes.
+        let mut buf = [0u8; 64];
+        buf[0..4].copy_from_slice(&SCREEN_DC.to_le_bytes());
+        buf[4..8].copy_from_slice(&1u32.to_le_bytes()); // fErase
+        buf[8..12].copy_from_slice(&0i32.to_le_bytes());
+        buf[12..16].copy_from_slice(&0i32.to_le_bytes());
+        buf[16..20].copy_from_slice(&(ctx.kernel.fb.width as i32).to_le_bytes());
+        buf[20..24].copy_from_slice(&(ctx.kernel.fb.height as i32).to_le_bytes());
+        ctx.cpu.write_mem(ps, &buf)?;
+    }
+    Ok(DispatchOutcome::ReturnedR0(SCREEN_DC))
+}
+
+fn end_paint(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL Rectangle(HDC, int l, int t, int r, int b)`
+fn rectangle(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    if hdc != SCREEN_DC {
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    let l = ctx.arg_u32(1)? as i32;
+    let t = ctx.arg_u32(2)? as i32;
+    let r = ctx.arg_u32(3)? as i32;
+    let b = ctx.arg_u32(4)? as i32;
+    // Fill with white, outline black — generic GDI default.
+    ctx.kernel
+        .fb
+        .fill_rect(l, t, r, b, [0xff, 0xff, 0xff, 0xff]);
+    ctx.kernel
+        .fb
+        .stroke_rect(l, t, r, b, [0x00, 0x00, 0x00, 0xff]);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `int FillRect(HDC, const RECT*, HBRUSH)`
+fn fill_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let rect = ctx.arg_u32(1)?;
+    let brush = ctx.arg_u32(2)?;
+    if hdc != SCREEN_DC || rect == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    let bytes = ctx.cpu.read_mem(rect, 16)?;
+    let l = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let t = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let r = i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let b = i32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let color = brush_color(brush).unwrap_or([0xc0, 0xc0, 0xc0, 0xff]);
+    ctx.kernel.fb.fill_rect(l, t, r, b, color);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pocket_cpu::{regs::ArmReg, stub::StubCpu, Cpu, Prot};
-    use pocket_kernel::{vfs::Vfs, Heap, KernelState, Thunk};
+    use pocket_kernel::{vfs::Vfs, Framebuffer, Heap, KernelState, Thunk};
     use pocket_pe::ImportBinding;
 
     fn fresh_kernel() -> KernelState {
         KernelState {
             heap: Heap::new(0x5000_0000, 0x10000),
             vfs: Vfs::new(),
+            fb: Framebuffer::new(240, 320),
         }
     }
 

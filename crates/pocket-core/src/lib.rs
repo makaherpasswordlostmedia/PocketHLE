@@ -121,6 +121,17 @@ impl Emulator {
             log::warn!("mount_dir called before load_pe; ignored");
         }
     }
+
+    /// Snapshot the host-visible RGBA framebuffer to a PNG file.
+    pub fn write_framebuffer_png(&self, path: &std::path::Path) -> Result<()> {
+        let fb = self
+            .process
+            .as_ref()
+            .map(|p| &p.state.fb)
+            .context("framebuffer unavailable — load_pe was not called")?;
+        fb.write_png(path)
+            .with_context(|| format!("writing framebuffer PNG to {}", path.display()))
+    }
 }
 
 #[cfg(test)]

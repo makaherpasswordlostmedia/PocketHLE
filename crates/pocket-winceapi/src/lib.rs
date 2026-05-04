@@ -147,7 +147,8 @@ impl Dispatcher for WinCeDispatcher {
 
         let key = (dll_key.clone(), name.clone());
         let outcome = if let Some(handler) = self.by_name.get(&key) {
-            log::trace!("call {}", thunk.label());
+            let lr = cpu.read_reg(ArmReg::Lr).unwrap_or(0);
+            log::trace!("call {} (lr=0x{:08x})", thunk.label(), lr);
             let mut ctx = CallCtx { cpu, thunk, kernel };
             match handler(&mut ctx) {
                 Ok(o) => Ok(o),

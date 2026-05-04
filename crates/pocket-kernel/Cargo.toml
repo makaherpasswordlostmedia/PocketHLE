@@ -16,6 +16,7 @@ byteorder.workspace = true
 
 pocket-cpu = { path = "../pocket-cpu" }
 pocket-pe = { path = "../pocket-pe" }
+png = "0.18"
 
 [dev-dependencies]
 tempfile = "3"
