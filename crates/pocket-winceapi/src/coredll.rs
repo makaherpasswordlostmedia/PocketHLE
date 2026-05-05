@@ -1048,11 +1048,16 @@ fn get_system_metrics(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelEr
 
 // ---------- GDI rasterisation ----------
 
-/// Sentinel HDC value our `BeginPaint` returns. Every GDI handler
-/// looks for this exact value before doing any rasterisation; that
-/// way handles produced by [`fake_gdi_handle`] (off-screen DCs the
-/// game sometimes creates for double-buffering) silently no-op.
-pub const SCREEN_DC: u32 = 0xDEAD_5C30;
+/// Sentinel HDC value our `BeginPaint` returns. Picked so it sits
+/// inside the synthetic HMODULE region (already mapped R/W in
+/// `Process::new`), so guest code that derefs the HDC as a struct
+/// pointer reads zeros instead of faulting. We park it well past
+/// the function-pointer-patching offsets some games use
+/// (`(handle + 0xb0)`). Off-screen DCs that the game creates via
+/// [`fake_gdi_handle`] use a different tagged range, so the GDI
+/// rasterisers can still tell "the screen DC" apart from
+/// double-buffer DCs and silently no-op for the latter.
+pub const SCREEN_DC: u32 = 0x1003_5C30;
 
 /// Tagged base for our fake brush handles. The low 24 bits hold the
 /// COLORREF the brush represents (0x00BBGGRR per the Win32 ABI).
