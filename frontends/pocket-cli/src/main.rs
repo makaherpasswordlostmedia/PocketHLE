@@ -164,6 +164,10 @@ fn cmd_demo_frame(out: &std::path::Path) -> Result<()> {
     // Title bar.
     fb.fill_rect(0, 0, w, 18, [0x14, 0x18, 0x24, 0xff]);
     fb.stroke_rect(0, 0, w, 18, [0xff, 0xff, 0xff, 0xff]);
+    // Title text.
+    fb.draw_text(8, 6, "PocketHLE demo", [0xff, 0xff, 0xff, 0xff]);
+    // Caption near the ball.
+    fb.draw_text(60, h - 16, "JumpyBall", [0xff, 0xff, 0xff, 0xff]);
     // Frame border.
     fb.stroke_rect(0, 0, w, h, [0xff, 0xff, 0xff, 0xff]);
     fb.write_png(out)

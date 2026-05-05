@@ -164,8 +164,9 @@ pub fn register(d: &mut WinCeDispatcher) {
     d.register_handler(dll, "SetBkMode", zero_returning);
     d.register_handler(dll, "SetBkColor", zero_returning);
     d.register_handler(dll, "SetTextColor", zero_returning);
-    d.register_handler(dll, "TextOutW", one_returning);
-    d.register_handler(dll, "ExtTextOutW", one_returning);
+    d.register_handler(dll, "TextOutW", text_out_w);
+    d.register_handler(dll, "ExtTextOutW", ext_text_out_w);
+    d.register_handler(dll, "DrawTextW", draw_text_w);
 }
 
 // ---------- generic helpers ----------
@@ -1135,6 +1136,78 @@ fn fill_rect(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let color = brush_color(brush).unwrap_or([0xc0, 0xc0, 0xc0, 0xff]);
     ctx.kernel.fb.fill_rect(l, t, r, b, color);
     Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL TextOutW(HDC, int x, int y, LPCWSTR lpString, int c)`
+fn text_out_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let x = ctx.arg_u32(1)? as i32;
+    let y = ctx.arg_u32(2)? as i32;
+    let str_ptr = ctx.arg_u32(3)?;
+    let count = ctx.arg_u32(4)? as i32;
+    if hdc != SCREEN_DC || str_ptr == 0 || count <= 0 {
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    let max = (count as u32 * 2).min(0x4000);
+    let bytes = ctx.cpu.read_mem(str_ptr, max)?;
+    let s = utf16_to_string(&bytes, count as usize);
+    log::info!("TextOutW(@{x},{y}, \"{s}\")");
+    ctx.kernel.fb.draw_text(x, y, &s, [0x00, 0x00, 0x00, 0xff]);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `BOOL ExtTextOutW(HDC, int x, int y, UINT, const RECT*, LPCWSTR, UINT, const INT*)`
+fn ext_text_out_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let x = ctx.arg_u32(1)? as i32;
+    let y = ctx.arg_u32(2)? as i32;
+    // arg3 is fuOptions, arg4 is RECT*, arg5 is LPCWSTR (stack arg).
+    let str_ptr = ctx.arg_u32(5)?;
+    let count = ctx.arg_u32(6)? as i32;
+    if hdc != SCREEN_DC || str_ptr == 0 || count <= 0 {
+        return Ok(DispatchOutcome::ReturnedR0(1));
+    }
+    let max = (count as u32 * 2).min(0x4000);
+    let bytes = ctx.cpu.read_mem(str_ptr, max)?;
+    let s = utf16_to_string(&bytes, count as usize);
+    log::info!("ExtTextOutW(@{x},{y}, \"{s}\")");
+    ctx.kernel.fb.draw_text(x, y, &s, [0x00, 0x00, 0x00, 0xff]);
+    Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// `int DrawTextW(HDC, LPCWSTR, int n, LPRECT, UINT)`
+fn draw_text_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let hdc = ctx.arg_u32(0)?;
+    let str_ptr = ctx.arg_u32(1)?;
+    let count = ctx.arg_u32(2)? as i32;
+    let rect = ctx.arg_u32(3)?;
+    if hdc != SCREEN_DC || str_ptr == 0 || rect == 0 {
+        return Ok(DispatchOutcome::ReturnedR0(0));
+    }
+    let bytes = ctx.cpu.read_mem(rect, 16)?;
+    let l = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let t = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let n = if count < 0 { 0x4000 } else { count as u32 * 2 };
+    let bytes = ctx.cpu.read_mem(str_ptr, n.min(0x4000))?;
+    let s = utf16_to_string(&bytes, count as usize);
+    log::info!("DrawTextW(rect=({l},{t}), \"{s}\")");
+    ctx.kernel.fb.draw_text(l, t, &s, [0x00, 0x00, 0x00, 0xff]);
+    Ok(DispatchOutcome::ReturnedR0(8))
+}
+
+fn utf16_to_string(bytes: &[u8], max_chars: usize) -> String {
+    let mut chars = Vec::new();
+    for i in 0..bytes.len() / 2 {
+        if chars.len() >= max_chars {
+            break;
+        }
+        let c = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+        if c == 0 {
+            break;
+        }
+        chars.push(c);
+    }
+    String::from_utf16_lossy(&chars)
 }
 
 #[cfg(test)]
