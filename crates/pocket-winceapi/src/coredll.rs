@@ -350,11 +350,14 @@ fn longjmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 }
 
 /// `_except_handler3` is the per-frame handler the MS C compiler
-/// installs for `__try`/`__except` blocks. With no SEH machinery in
-/// HLE we simply tell the runtime that we did not handle the
-/// exception — `ExceptionContinueSearch == 1`.
+/// installs for `__try`/`__except` blocks. We return
+/// `ExceptionContinueExecution == 0`, which lies to the unwind
+/// machinery and tells it the exception is fully handled. This is
+/// not technically correct, but in practice it stops the runtime
+/// from longjmp'ing back through a NULL `jmp_buf` that it manages
+/// internally and which we have not initialised.
 fn except_handler3(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
-    Ok(DispatchOutcome::ReturnedR0(1))
+    Ok(DispatchOutcome::ReturnedR0(0))
 }
 
 // ---------- mem / string CRT ----------

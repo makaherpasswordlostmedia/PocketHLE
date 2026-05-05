@@ -154,6 +154,16 @@ pub const TRAMPOLINE_RETURN_VA: u32 = 0x7E00_0000;
 pub const SCRATCH_PAGE_VA: u32 = 0x7F00_0000;
 pub const SCRATCH_PAGE_SIZE: u32 = 0x10_0000;
 
+/// Synthetic "module image" region returned by `LoadLibraryW` /
+/// `GetModuleHandleW` as the HMODULE for any DLL the game asks for.
+/// We map a real (zero-filled, R/W) page here so that games which
+/// treat the HMODULE as a writable struct pointer — e.g. patching a
+/// function-pointer slot at `(handle + 0xb0)` — don't fault on the
+/// write. Sized at 1 MiB so games can scribble fairly far into the
+/// "module" without falling off the end.
+pub const FAKE_MODULE_BASE: u32 = 0x1000_0000;
+pub const FAKE_MODULE_SIZE: u32 = 0x10_0000;
+
 /// Software framebuffer backing GDI and GAPI rendering.
 ///
 /// We keep two parallel buffers: the *guest* RGB565 buffer that lives
@@ -497,6 +507,13 @@ impl Process {
         cpu.map_region(TRAMPOLINE_RETURN_VA, 0x1000, Prot::READ | Prot::EXEC)?;
         cpu.write_mem(TRAMPOLINE_RETURN_VA, &ARM_BX_LR)?;
         cpu.add_code_hook(TRAMPOLINE_RETURN_VA)?;
+
+        // 8a. Map a writable region at the synthetic HMODULE address.
+        //     Games sometimes treat the HMODULE returned from
+        //     LoadLibraryW as a struct pointer (e.g. patching a
+        //     function-pointer slot at `(handle + 0xb0)`). Without
+        //     this page they fault on the write.
+        cpu.map_region(FAKE_MODULE_BASE, FAKE_MODULE_SIZE, Prot::READ | Prot::WRITE)?;
 
         // 8. Map a zeroed scratch page used as a "safe pointer" for
         //    unimplemented APIs. Reading from it returns 0; writing to
