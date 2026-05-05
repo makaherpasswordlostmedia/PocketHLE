@@ -140,6 +140,14 @@ pub struct KernelState {
 /// and returns control to the dispatcher loop.
 pub const TRAMPOLINE_RETURN_VA: u32 = 0x7E00_0000;
 
+/// Synthetic always-zero scratch page returned for unknown / unmapped
+/// API calls. Pre-mapped read/write, kept zero, and large enough that
+/// games which dereference an opaque "handle" or "struct pointer"
+/// from an unimplemented API see a well-formed zero-filled buffer
+/// instead of a NULL deref. 4 KiB is plenty.
+pub const SCRATCH_PAGE_VA: u32 = 0x7F00_0000;
+pub const SCRATCH_PAGE_SIZE: u32 = 0x1000;
+
 /// Software framebuffer backing GDI and GAPI rendering.
 ///
 /// We keep two parallel buffers: the *guest* RGB565 buffer that lives
@@ -480,6 +488,13 @@ impl Process {
         cpu.write_mem(TRAMPOLINE_RETURN_VA, &ARM_BX_LR)?;
         cpu.add_code_hook(TRAMPOLINE_RETURN_VA)?;
 
+        // 8. Map a zeroed scratch page used as a "safe pointer" for
+        //    unimplemented APIs. Reading from it returns 0; writing to
+        //    it is harmless (and ignored by callers). Many WinCE
+        //    games fetch a struct via an API and then deref it
+        //    immediately; without this page they would NULL-deref.
+        cpu.map_region(SCRATCH_PAGE_VA, SCRATCH_PAGE_SIZE, Prot::READ | Prot::WRITE)?;
+
         Ok(Process {
             image,
             thunks,
@@ -573,7 +588,11 @@ pub fn run_main_loop(
                     }
                     DispatchOutcome::ReturnedR0(v) => Some((v, None)),
                     DispatchOutcome::ReturnedR0R1(a, b) => Some((a, Some(b))),
-                    DispatchOutcome::Unimplemented => Some((0, None)),
+                    // For unknown ordinals, return a pre-mapped
+                    // zero-page address. Games that use the result as
+                    // a BOOL see a non-zero (so "success"); games that
+                    // dereference it as a handle/struct see zeros.
+                    DispatchOutcome::Unimplemented => Some((SCRATCH_PAGE_VA, None)),
                     DispatchOutcome::Trampoline { target, lr, args } => {
                         cpu.write_reg(ArmReg::R0, args[0])?;
                         cpu.write_reg(ArmReg::R1, args[1])?;
