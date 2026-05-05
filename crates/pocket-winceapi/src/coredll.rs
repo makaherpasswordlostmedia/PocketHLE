@@ -1081,6 +1081,17 @@ fn begin_paint(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         buf[20..24].copy_from_slice(&(ctx.kernel.fb.height as i32).to_le_bytes());
         ctx.cpu.write_mem(ps, &buf)?;
     }
+    // Clear the framebuffer to white as a real `fErase`-style
+    // BeginPaint would. The first thing GDI guarantees on a
+    // BeginPaint is that the invalid rect is cleared to the
+    // window's background brush; we approximate that with white
+    // so subsequent SetTextColor / TextOutW handlers (which we
+    // do implement) actually appear over a sensible backdrop.
+    let w = ctx.kernel.fb.width as i32;
+    let h = ctx.kernel.fb.height as i32;
+    ctx.kernel
+        .fb
+        .fill_rect(0, 0, w, h, [0xff, 0xff, 0xff, 0xff]);
     Ok(DispatchOutcome::ReturnedR0(SCREEN_DC))
 }
 
