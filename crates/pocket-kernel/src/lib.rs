@@ -144,9 +144,15 @@ pub const TRAMPOLINE_RETURN_VA: u32 = 0x7E00_0000;
 /// API calls. Pre-mapped read/write, kept zero, and large enough that
 /// games which dereference an opaque "handle" or "struct pointer"
 /// from an unimplemented API see a well-formed zero-filled buffer
-/// instead of a NULL deref. 4 KiB is plenty.
+/// instead of a NULL deref.
+///
+/// We size this generously (1 MiB) so that callers walking large
+/// arrays through a sentinel pointer — e.g. reading
+/// `((MyStruct*)ret)->field[100]` where each field is a few hundred
+/// bytes — don't fall off the end and crash. Real games rarely
+/// touch more than a few KiB through such a pointer.
 pub const SCRATCH_PAGE_VA: u32 = 0x7F00_0000;
-pub const SCRATCH_PAGE_SIZE: u32 = 0x1000;
+pub const SCRATCH_PAGE_SIZE: u32 = 0x10_0000;
 
 /// Software framebuffer backing GDI and GAPI rendering.
 ///
@@ -405,12 +411,16 @@ impl Process {
         cpu: &mut dyn Cpu,
         ordinal_resolver: &dyn Fn(&str, u16) -> Option<String>,
     ) -> Result<Self, KernelError> {
-        // 1. Map every section.
+        // 1. Map every section. We deliberately treat every section
+        //    (including .rdata / .pdata / .rsrc) as writable: WinCE 5
+        //    games built with the MS toolchain frequently encode
+        //    initialised mutable globals into .rdata and rely on the
+        //    OS loader leaving the segment writable. Honouring the
+        //    strict R-only flag triggers WRITE_PROT crashes inside
+        //    library code (e.g. `_setjmp`/`longjmp` glue patching the
+        //    .rdata-resident jmp_buf table).
         for s in &image.sections {
-            let mut prot = Prot::READ;
-            if s.is_writable() {
-                prot |= Prot::WRITE;
-            }
+            let mut prot = Prot::READ | Prot::WRITE;
             if s.is_executable() {
                 prot |= Prot::EXEC;
             }
