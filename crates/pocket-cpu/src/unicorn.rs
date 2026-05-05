@@ -14,6 +14,29 @@ use crate::{regs::ArmReg, Arch, Cpu, CpuError, Prot, StopReason};
 /// 4 KiB aligned page size used for lazy mapping of unmapped accesses.
 const LAZY_PAGE_SIZE: u64 = 0x1000;
 
+/// Decide whether an unmapped access at `addr` should be lazily
+/// backed by a fresh zero page. We only do this for pages that
+/// almost certainly came from a corrupt / NULL pointer — never
+/// for arbitrary middle-address accesses, because those usually
+/// indicate the guest has wandered off into random memory and
+/// should be reported as a crash rather than papered over.
+fn should_lazy_map(addr: u64) -> bool {
+    let page = addr & !(LAZY_PAGE_SIZE - 1);
+    // The first 16 pages (~64 KiB) catch NULL / NULL+offset derefs
+    // — by far the most common cause of crashes when an
+    // unimplemented coredll API returns 0 and the game treats it
+    // as a struct pointer.
+    if page <= 0x0000_f000 {
+        return true;
+    }
+    // The last legal page catches `pop {pc}` reading 0xffffffff /
+    // 0xfffffffc off a half-cleaned stack.
+    if page == 0xffff_f000 {
+        return true;
+    }
+    false
+}
+
 pub struct UnicornCpu {
     uc: Unicorn<'static, ()>,
     last_hook: Rc<RefCell<Option<u32>>>,
@@ -39,13 +62,10 @@ impl UnicornCpu {
             1,
             0,
             move |uc, _ty: MemType, addr: u64, _size: usize, _val: i64| {
-                let page = addr & !(LAZY_PAGE_SIZE - 1);
-                // Skip pages above the 32-bit address space (would
-                // overflow when computing end). 0xffff_f000 is the
-                // last legal page (0xffff_f000..0xffff_ffff inclusive).
-                if page > 0xffff_f000 {
+                if !should_lazy_map(addr) {
                     return false;
                 }
+                let page = addr & !(LAZY_PAGE_SIZE - 1);
                 // Give the lazy page R+W+EXEC and pre-fill it with
                 // `bx lr` so it's safe for both data and instruction
                 // accesses (a page is sometimes touched as data first
@@ -87,10 +107,10 @@ impl UnicornCpu {
             1,
             0,
             move |uc, _ty: MemType, addr: u64, _size: usize, _val: i64| {
-                let page = addr & !(LAZY_PAGE_SIZE - 1);
-                if page > 0xffff_f000 {
+                if !should_lazy_map(addr) {
                     return false;
                 }
+                let page = addr & !(LAZY_PAGE_SIZE - 1);
                 let prot = UcProt::READ | UcProt::WRITE | UcProt::EXEC;
                 if uc.mem_map(page, LAZY_PAGE_SIZE, prot).is_err() {
                     return false;
@@ -196,13 +216,14 @@ impl Cpu for UnicornCpu {
         let end_addr = (va as u64).saturating_add(data.len() as u64);
         let mut page = start;
         while page < end_addr && page <= 0xffff_f000 {
-            // Probe whether the page is already mapped.
-            let mut probe = [0u8; 1];
-            if self.uc.mem_read(page, &mut probe).is_err() {
-                let prot = UcProt::READ | UcProt::WRITE | UcProt::EXEC;
-                if self.uc.mem_map(page, LAZY_PAGE_SIZE, prot).is_ok() {
-                    let zeros = vec![0u8; LAZY_PAGE_SIZE as usize];
-                    let _ = self.uc.mem_write(page, &zeros);
+            if should_lazy_map(page) {
+                let mut probe = [0u8; 1];
+                if self.uc.mem_read(page, &mut probe).is_err() {
+                    let prot = UcProt::READ | UcProt::WRITE | UcProt::EXEC;
+                    if self.uc.mem_map(page, LAZY_PAGE_SIZE, prot).is_ok() {
+                        let zeros = vec![0u8; LAZY_PAGE_SIZE as usize];
+                        let _ = self.uc.mem_write(page, &zeros);
+                    }
                 }
             }
             page = page.saturating_add(LAZY_PAGE_SIZE);
@@ -225,12 +246,14 @@ impl Cpu for UnicornCpu {
         let end_addr = (va as u64).saturating_add(len as u64);
         let mut page = start;
         while page < end_addr && page <= 0xffff_f000 {
-            let mut probe = [0u8; 1];
-            if self.uc.mem_read(page, &mut probe).is_err() {
-                let prot = UcProt::READ | UcProt::WRITE | UcProt::EXEC;
-                if self.uc.mem_map(page, LAZY_PAGE_SIZE, prot).is_ok() {
-                    let zeros = vec![0u8; LAZY_PAGE_SIZE as usize];
-                    let _ = self.uc.mem_write(page, &zeros);
+            if should_lazy_map(page) {
+                let mut probe = [0u8; 1];
+                if self.uc.mem_read(page, &mut probe).is_err() {
+                    let prot = UcProt::READ | UcProt::WRITE | UcProt::EXEC;
+                    if self.uc.mem_map(page, LAZY_PAGE_SIZE, prot).is_ok() {
+                        let zeros = vec![0u8; LAZY_PAGE_SIZE as usize];
+                        let _ = self.uc.mem_write(page, &zeros);
+                    }
                 }
             }
             page = page.saturating_add(LAZY_PAGE_SIZE);

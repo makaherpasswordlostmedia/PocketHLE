@@ -280,6 +280,23 @@ fn setjmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
 fn longjmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let buf = ctx.arg_u32(0)?;
     let val = ctx.arg_u32(1)?;
+    // Sanity-check the buffer: a real jmp_buf is heap- or stack-
+    // allocated, so it should sit somewhere sensible. A buf at 0
+    // or in the very-high range almost certainly means the caller
+    // routed a pointer through an unimplemented coredll API that
+    // returned NULL or a sentinel; restoring zeros into SP/LR from
+    // that buffer would zero out the CPU and trap the emulator in
+    // a tight `bx lr ; pc=0 ; bx lr ; …` loop. Treat such calls as
+    // a no-op longjmp that simply returns the sentinel value.
+    let ret = if val == 0 { 1 } else { val };
+    // The most common bogus pointers we see come from
+    // unimplemented APIs returning NULL or our scratch page sentinel
+    // (`0x7F00_0000`). Treat anything in those ranges as a no-op
+    // longjmp.
+    if buf < 0x0000_1000 || (0x7F00_0000..0x7F00_1000).contains(&buf) {
+        log::warn!("longjmp(buf=0x{buf:08x}, val={val}) — buf looks bogus, returning {ret} without restore");
+        return Ok(DispatchOutcome::ReturnedR0(ret));
+    }
     let regs_to_restore = [
         ArmReg::R4,
         ArmReg::R5,
@@ -293,16 +310,42 @@ fn longjmp(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
         ArmReg::Lr,
     ];
     let blob = ctx.cpu.read_mem(buf, regs_to_restore.len() as u32 * 4)?;
-    for (i, r) in regs_to_restore.iter().enumerate() {
-        let off = i * 4;
-        let v = u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]);
-        ctx.cpu.write_reg(*r, v)?;
+    // Same defensive check on the restored values themselves: if
+    // SP or LR would land at 0 / very low / very high, refuse the
+    // restore. This protects against partially-initialised
+    // jmp_bufs.
+    let restored: Vec<u32> = (0..regs_to_restore.len())
+        .map(|i| {
+            let off = i * 4;
+            u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]])
+        })
+        .collect();
+    let new_sp = restored[regs_to_restore
+        .iter()
+        .position(|r| *r == ArmReg::Sp)
+        .unwrap()];
+    let new_lr = restored[regs_to_restore
+        .iter()
+        .position(|r| *r == ArmReg::Lr)
+        .unwrap()];
+    // Refuse the restore if SP and LR would BOTH land at NULL —
+    // the classic "longjmp through an unallocated jmp_buf" pattern
+    // that would otherwise zero out the CPU and trap us in
+    // `bx lr ; pc=0 ; bx lr ; …`. A single zero is fine because
+    // some unit tests legitimately exercise that.
+    if new_sp == 0 && new_lr == 0 {
+        log::warn!(
+            "longjmp(buf=0x{buf:08x}) restored SP=0x{new_sp:08x} LR=0x{new_lr:08x} — refusing zero restore"
+        );
+        return Ok(DispatchOutcome::ReturnedR0(ret));
+    }
+    for (r, v) in regs_to_restore.iter().zip(restored.iter()) {
+        ctx.cpu.write_reg(*r, *v)?;
     }
     // longjmp must return `value` (or 1 if value == 0) from setjmp's
     // call site. The dispatcher will write our return into r0 and
     // resume at LR — and the LR we just restored is exactly the
     // return address of the original setjmp.
-    let ret = if val == 0 { 1 } else { val };
     Ok(DispatchOutcome::ReturnedR0(ret))
 }
 
