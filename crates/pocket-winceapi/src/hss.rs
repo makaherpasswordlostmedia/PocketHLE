@@ -13,22 +13,33 @@ use crate::{CallCtx, WinCeDispatcher};
 
 pub fn register(d: &mut WinCeDispatcher) {
     let dll = "hss.dll";
-    let stubs = [
-        // hssSound
+    // C++ constructors / destructors on the MS ARM ABI take `this`
+    // in r0 and must return it back in r0 — otherwise the caller
+    // walks off with a 1 (or 0) pointer and trashes everything it
+    // touches. List them separately so we can hand the right
+    // handler to each.
+    let ctor_dtors = [
         "??0hssSound@@QAA@XZ",
         "??1hssSound@@UAA@XZ",
+        "??0hssMusic@@QAA@XZ",
+        "??1hssMusic@@UAA@XZ",
+        "??0hssSpeaker@@QAA@XZ",
+        "??1hssSpeaker@@UAA@XZ",
+    ];
+    for f in ctor_dtors {
+        d.register_handler(dll, f, ctor_dtor_passthrough);
+    }
+    // Member functions: they all return success or a generic
+    // non-zero handle. C++ member fns also take `this` in r0 but
+    // they have a normal int/handle/HRESULT return value, so we
+    // can keep returning 1 here.
+    let stubs = [
         "?volume@hssSound@@QAAXI@Z",
         "?loop@hssSound@@QAAX_N@Z",
         "?load@hssSound@@QAAHPBG@Z",
-        // hssMusic
-        "??0hssMusic@@QAA@XZ",
-        "??1hssMusic@@UAA@XZ",
         "?volume@hssMusic@@QAAXI@Z",
         "?loop@hssMusic@@QAAX_N@Z",
         "?load@hssMusic@@QAAHPBG@Z",
-        // hssSpeaker
-        "??0hssSpeaker@@QAA@XZ",
-        "??1hssSpeaker@@UAA@XZ",
         "?open@hssSpeaker@@QAAHII_NII@Z",
         "?volumeSounds@hssSpeaker@@QAAXI@Z",
         "?volumeSounds@hssSpeaker@@QAAIXZ",
@@ -42,6 +53,16 @@ pub fn register(d: &mut WinCeDispatcher) {
     for f in stubs {
         d.register_handler(dll, f, ok);
     }
+}
+
+/// C++ constructor/destructor stub. Returns `this` (the first
+/// argument) so that `Foo* p = new Foo;` style call sites get back
+/// the same heap pointer they passed in. Returning a flat `1` here
+/// silently corrupts everything the game does with the resulting
+/// "object" pointer.
+fn ctor_dtor_passthrough(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let this = ctx.arg_u32(0)?;
+    Ok(DispatchOutcome::ReturnedR0(this))
 }
 
 fn ok(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
