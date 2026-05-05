@@ -27,7 +27,10 @@ use pocket_kernel::{DispatchOutcome, KernelError};
 use crate::{CallCtx, WinCeDispatcher};
 
 const FAKE_MODULE_HANDLE: u32 = 0x1000_0000;
-const FAKE_HWND: u32 = 0xDEAD_0001;
+/// Sentinel `HWND` value for the synthetic window we hand games.
+/// Parked inside the synthetic HMODULE region (R/W mapped) so guest
+/// code can deref it as a struct pointer without faulting.
+const FAKE_HWND: u32 = 0x1004_0001;
 const FAKE_GDI_BASE: u32 = 0xDEAD_1000;
 const INVALID_HANDLE_VALUE: u32 = 0xFFFF_FFFF;
 
