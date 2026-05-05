@@ -572,6 +572,13 @@ pub fn run_main_loop(
         pc,
         process.stack_top
     );
+    // Track tight infinite loops between thunk hits: if the same
+    // PC turns up `STALL_THRESHOLD` slices in a row, we know the
+    // game is spinning on something we don't yet emulate, and we
+    // log a louder warning so the operator knows where to dig.
+    const STALL_THRESHOLD: u32 = 4;
+    let mut last_resume_pc: u32 = 0;
+    let mut stall_count: u32 = 0;
     for _slice in 0..max_slices {
         let stop = match cpu.run_until_hook(pc, instruction_budget_per_slice) {
             Ok(s) => s,
@@ -588,7 +595,20 @@ pub fn run_main_loop(
         match stop {
             StopReason::InstructionLimit => {
                 pc = cpu.read_reg(ArmReg::Pc)?;
-                log::trace!("instruction slice exhausted; resume pc=0x{pc:08x}");
+                if pc == last_resume_pc {
+                    stall_count += 1;
+                    if stall_count == STALL_THRESHOLD {
+                        log::warn!(
+                            "guest appears stuck near pc=0x{pc:08x} for {} slices ({} instr each)",
+                            stall_count,
+                            instruction_budget_per_slice
+                        );
+                    }
+                } else {
+                    stall_count = 0;
+                    last_resume_pc = pc;
+                    log::debug!("instruction slice exhausted; resume pc=0x{pc:08x}");
+                }
                 continue;
             }
             StopReason::Hook(addr) => {
