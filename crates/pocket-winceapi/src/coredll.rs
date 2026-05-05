@@ -979,8 +979,16 @@ const WM_PAINT: u32 = 0x000F;
 fn get_message_w(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     let lp_msg = ctx.arg_u32(0)?;
     let phase = ctx.kernel.message_phase;
+    // Phase 0..=2 always synthesises WM_PAINT so a typical
+    //     while (GetMessage(...) > 0) { TranslateMessage(); DispatchMessage(); }
+    // loop sees three repaint requests and exercises the game's
+    // paint path more than once. Phase 3 returns WM_QUIT so the
+    // loop terminates cleanly. We do this even when no WNDPROC has
+    // been registered: many Pocket PC games handle messages inline
+    // off the result of `GetMessageW` without bothering with a
+    // class registration.
     let (msg_id, ret) = match phase {
-        0 if ctx.kernel.wnd_proc != 0 => (WM_PAINT, 1u32),
+        0..=2 => (WM_PAINT, 1u32),
         _ => (WM_QUIT, 0u32),
     };
     ctx.kernel.message_phase = phase.saturating_add(1);
