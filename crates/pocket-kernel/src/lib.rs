@@ -603,6 +603,18 @@ pub fn run_main_loop(
                             stall_count,
                             instruction_budget_per_slice
                         );
+                        // A stall at PC=0 (or in the first lazy-mapped
+                        // page) almost always means the guest has
+                        // returned past its initial entry-point LR
+                        // sentinel and is now NOP-grinding through
+                        // page zero. Treat that as a clean exit so
+                        // the operator gets a final framebuffer
+                        // snapshot instead of running out the slice
+                        // budget.
+                        if pc < 0x0001_0000 {
+                            log::info!("guest stalled in low memory; treating as graceful exit");
+                            return Ok(());
+                        }
                     }
                 } else {
                     stall_count = 0;
