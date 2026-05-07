@@ -128,7 +128,13 @@ impl Default for GameSettings {
 }
 
 fn default_max_slices() -> u64 {
-    1024
+    // Real PPC2003 games typically need a few hundred thousand
+    // slices to finish their CRT init / soft-float lookup tables /
+    // bitmap loading before the first WM_PAINT is delivered.
+    // A 1024-slice budget would time out long before the title
+    // screen, so we ship with enough headroom that a freshly
+    // imported game renders out of the box.
+    2_000_000
 }
 
 fn default_instructions_per_slice() -> u64 {
