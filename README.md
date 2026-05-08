@@ -203,7 +203,7 @@ delivered. `pockethle run` therefore defaults to `--max-slices
 2_000_000`; pass a smaller value for fast smoke tests, or `0` for no
 upper bound.
 
-The first time you run an unfamiliar binary, expect to see lines
+The first time you run an unfamiliar binary, expect to see lines hui
 like:
 
 ```
