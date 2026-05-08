@@ -24,9 +24,15 @@ use indexmap::IndexMap;
 use thiserror::Error;
 
 use pocket_cpu::{dump_mem_around, dump_regs, regs::ArmReg, Cpu, CpuError, Prot, StopReason};
-use pocket_pe::{ImportBinding, ImportSymbol, LoadedImage};
+use pocket_pe::{ImportBinding, ImportSymbol, LoadedImage, ResourceEntry};
 
+pub mod font;
+pub mod framebuffer;
+pub mod gdi;
 pub mod vfs;
+
+pub use framebuffer::{Framebuffer, FB_BYTES, FB_HEIGHT, FB_WIDTH};
+pub use gdi::{GdiState, Surface};
 
 /// Default base address of the synthetic IAT thunk pool.
 pub const THUNK_REGION_BASE: u32 = 0x7000_0000;
@@ -54,7 +60,12 @@ pub const KERNEL_TRAP_SIZE: u32 = 0x0001_0000;
 /// Base of the guest-side heap region. 16 MiB is plenty for the
 /// little games we target and still leaves headroom for the stack.
 pub const HEAP_BASE: u32 = 0x5000_0000;
-pub const HEAP_SIZE: u32 = 0x0100_0000;
+/// 64 MiB. Real Pocket PC processes only get ~32 MiB of total VA,
+/// but games almost never come close to that — and our handle table
+/// for `CreateDIBSection` etc. lives inside the same heap region,
+/// so we keep it generous so back-to-back DIB allocations don't run
+/// the game into an unmapped page.
+pub const HEAP_SIZE: u32 = 0x0400_0000;
 
 /// Base of the GAPI / GDI framebuffer the guest writes pixels into.
 /// Pocket PC's GAPI exposes a 240×320 16-bit RGB565 surface. We map
@@ -93,18 +104,11 @@ pub enum DispatchOutcome {
     /// The host has not implemented this API. PocketHLE will log a
     /// loud warning and synthesize a `0` return.
     Unimplemented,
-    /// Trampoline guest execution into another guest function (e.g.
-    /// `DispatchMessageW` re-entering the registered `WndProc`).
-    /// `target` becomes the next PC; `lr` is loaded into LR so the
-    /// callee returns to a synthesised stub address. `args` is loaded
-    /// into R0..R3 in order. The dispatcher loop does not synthesise
-    /// an R0 return value when this variant is used — the real R0
-    /// will be whatever the callee leaves there.
-    Trampoline {
-        target: u32,
-        lr: u32,
-        args: [u32; 4],
-    },
+    /// Reroute control flow into the guest at `pc`, leaving LR/SP and
+    /// argument registers exactly as the handler set them up. Used to
+    /// trampoline into guest WndProc / atexit / signal handlers from
+    /// inside an HLE call (e.g. `DispatchMessageW`).
+    JumpTo(u32),
 }
 
 /// Trait an API layer registers with the kernel. Called every time
@@ -125,320 +129,42 @@ pub trait Dispatcher {
 pub struct KernelState {
     pub heap: Heap,
     pub vfs: vfs::Vfs,
-    pub fb: Framebuffer,
-    /// Address of the last `WNDPROC` registered through
-    /// `RegisterClassW`. Used by `DispatchMessageW` to re-enter the
-    /// guest paint handler. `0` means "no class registered yet".
+    /// Software-rendered display the GDI/GAPI handlers paint into.
+    pub framebuffer: Framebuffer,
+    /// Tracked GDI objects (DCs, bitmaps, brushes, pens, fonts).
+    pub gdi: GdiState,
+    /// Flat resource table for `FindResourceW` / `LoadResource`.
+    pub resources: Vec<ResourceEntry>,
+    /// Image base for resource RVA → VA conversion.
+    pub image_base: u32,
+    /// Set the first time `GXBeginDraw` runs. The dispatcher maps the
+    /// framebuffer region into the guest VA space lazily — but that
+    /// requires `&mut dyn Cpu`, which isn't available outside a call,
+    /// so we let the GAPI handlers do it.
+    pub fb_mapped: bool,
+    /// Number of synthetic `WM_PAINT` / `WM_TIMER` messages already
+    /// fed to the guest. Used by `GetMessageW` / `PeekMessageW` to
+    /// terminate the message loop after a configurable number of
+    /// frames, so headless runs don't loop forever.
+    pub synthetic_message_count: u64,
+    /// Maximum synthetic frame messages to inject. `0` means
+    /// unlimited.
+    pub synthetic_message_budget: u64,
+    /// Address of the guest's last-registered window procedure. Set
+    /// by `RegisterClassW`, used by `DispatchMessageW` to trampoline
+    /// into guest-side WM_PAINT / WM_KEYDOWN handlers.
     pub wnd_proc: u32,
-    /// Counter for the synthetic `GetMessageW` queue: 0 → WM_PAINT,
-    /// 1+ → WM_QUIT. Lets us drive a single paint cycle.
-    pub message_phase: u32,
-}
-
-/// Synthetic LR address `DispatchMessageW` uses when trampolining
-/// into a `WNDPROC`. Hitting this address ends the inner emulation
-/// and returns control to the dispatcher loop.
-pub const TRAMPOLINE_RETURN_VA: u32 = 0x7E00_0000;
-
-/// Synthetic always-zero scratch page returned for unknown / unmapped
-/// API calls. Pre-mapped read/write, kept zero, and large enough that
-/// games which dereference an opaque "handle" or "struct pointer"
-/// from an unimplemented API see a well-formed zero-filled buffer
-/// instead of a NULL deref.
-///
-/// We size this generously (1 MiB) so that callers walking large
-/// arrays through a sentinel pointer — e.g. reading
-/// `((MyStruct*)ret)->field[100]` where each field is a few hundred
-/// bytes — don't fall off the end and crash. Real games rarely
-/// touch more than a few KiB through such a pointer.
-pub const SCRATCH_PAGE_VA: u32 = 0x7F00_0000;
-pub const SCRATCH_PAGE_SIZE: u32 = 0x10_0000;
-
-/// Synthetic "module image" region returned by `LoadLibraryW` /
-/// `GetModuleHandleW` as the HMODULE for any DLL the game asks for.
-/// We map a real (zero-filled, R/W) page here so that games which
-/// treat the HMODULE as a writable struct pointer — e.g. patching a
-/// function-pointer slot at `(handle + 0xb0)` — don't fault on the
-/// write. Sized at 1 MiB so games can scribble fairly far into the
-/// "module" without falling off the end.
-pub const FAKE_MODULE_BASE: u32 = 0x1000_0000;
-pub const FAKE_MODULE_SIZE: u32 = 0x10_0000;
-
-/// Software framebuffer backing GDI and GAPI rendering.
-///
-/// We keep two parallel buffers: the *guest* RGB565 buffer that lives
-/// inside CPU memory at [`FRAMEBUFFER_BASE`] (which the game writes to
-/// via GAPI), and a host-side RGBA8888 mirror that GDI handlers
-/// (BeginPaint / Rectangle / FillRect / TextOutW) rasterise into.
-///
-/// `present_from_guest` is called by `?GXEndDraw@@YAHXZ` and copies
-/// the guest's RGB565 over into the RGBA mirror.
-///
-/// `to_png` writes the RGBA mirror to a PNG file using the `png`
-/// crate.
-///
-/// 5x7 ASCII bitmap font used by [`Framebuffer::draw_char`].
-/// Bytes encode columns (LSB = top row). Range covered is
-/// 0x20..=0x7E ("printable ASCII"). Original glyphs derived from
-/// the public-domain "Tom Thumb" / "5x7 LCD" pattern that ships
-/// with most micro-controller GFX libraries.
-#[rustfmt::skip]
-const FONT5X7: [[u8; 5]; 95] = [
-    [0x00,0x00,0x00,0x00,0x00], // 0x20 ' '
-    [0x00,0x00,0x5F,0x00,0x00], // 0x21 '!'
-    [0x00,0x07,0x00,0x07,0x00], // 0x22 '"'
-    [0x14,0x7F,0x14,0x7F,0x14], // 0x23 '#'
-    [0x24,0x2A,0x7F,0x2A,0x12], // 0x24 '$'
-    [0x23,0x13,0x08,0x64,0x62], // 0x25 '%'
-    [0x36,0x49,0x55,0x22,0x50], // 0x26 '&'
-    [0x00,0x05,0x03,0x00,0x00], // 0x27 '\''
-    [0x00,0x1C,0x22,0x41,0x00], // 0x28 '('
-    [0x00,0x41,0x22,0x1C,0x00], // 0x29 ')'
-    [0x14,0x08,0x3E,0x08,0x14], // 0x2A '*'
-    [0x08,0x08,0x3E,0x08,0x08], // 0x2B '+'
-    [0x00,0x50,0x30,0x00,0x00], // 0x2C ','
-    [0x08,0x08,0x08,0x08,0x08], // 0x2D '-'
-    [0x00,0x60,0x60,0x00,0x00], // 0x2E '.'
-    [0x20,0x10,0x08,0x04,0x02], // 0x2F '/'
-    [0x3E,0x51,0x49,0x45,0x3E], // 0x30 '0'
-    [0x00,0x42,0x7F,0x40,0x00], // 0x31 '1'
-    [0x42,0x61,0x51,0x49,0x46], // 0x32 '2'
-    [0x21,0x41,0x45,0x4B,0x31], // 0x33 '3'
-    [0x18,0x14,0x12,0x7F,0x10], // 0x34 '4'
-    [0x27,0x45,0x45,0x45,0x39], // 0x35 '5'
-    [0x3C,0x4A,0x49,0x49,0x30], // 0x36 '6'
-    [0x01,0x71,0x09,0x05,0x03], // 0x37 '7'
-    [0x36,0x49,0x49,0x49,0x36], // 0x38 '8'
-    [0x06,0x49,0x49,0x29,0x1E], // 0x39 '9'
-    [0x00,0x36,0x36,0x00,0x00], // 0x3A ':'
-    [0x00,0x56,0x36,0x00,0x00], // 0x3B ';'
-    [0x08,0x14,0x22,0x41,0x00], // 0x3C '<'
-    [0x14,0x14,0x14,0x14,0x14], // 0x3D '='
-    [0x00,0x41,0x22,0x14,0x08], // 0x3E '>'
-    [0x02,0x01,0x51,0x09,0x06], // 0x3F '?'
-    [0x32,0x49,0x79,0x41,0x3E], // 0x40 '@'
-    [0x7E,0x11,0x11,0x11,0x7E], // 0x41 'A'
-    [0x7F,0x49,0x49,0x49,0x36], // 0x42 'B'
-    [0x3E,0x41,0x41,0x41,0x22], // 0x43 'C'
-    [0x7F,0x41,0x41,0x22,0x1C], // 0x44 'D'
-    [0x7F,0x49,0x49,0x49,0x41], // 0x45 'E'
-    [0x7F,0x09,0x09,0x09,0x01], // 0x46 'F'
-    [0x3E,0x41,0x49,0x49,0x7A], // 0x47 'G'
-    [0x7F,0x08,0x08,0x08,0x7F], // 0x48 'H'
-    [0x00,0x41,0x7F,0x41,0x00], // 0x49 'I'
-    [0x20,0x40,0x41,0x3F,0x01], // 0x4A 'J'
-    [0x7F,0x08,0x14,0x22,0x41], // 0x4B 'K'
-    [0x7F,0x40,0x40,0x40,0x40], // 0x4C 'L'
-    [0x7F,0x02,0x0C,0x02,0x7F], // 0x4D 'M'
-    [0x7F,0x04,0x08,0x10,0x7F], // 0x4E 'N'
-    [0x3E,0x41,0x41,0x41,0x3E], // 0x4F 'O'
-    [0x7F,0x09,0x09,0x09,0x06], // 0x50 'P'
-    [0x3E,0x41,0x51,0x21,0x5E], // 0x51 'Q'
-    [0x7F,0x09,0x19,0x29,0x46], // 0x52 'R'
-    [0x46,0x49,0x49,0x49,0x31], // 0x53 'S'
-    [0x01,0x01,0x7F,0x01,0x01], // 0x54 'T'
-    [0x3F,0x40,0x40,0x40,0x3F], // 0x55 'U'
-    [0x1F,0x20,0x40,0x20,0x1F], // 0x56 'V'
-    [0x3F,0x40,0x38,0x40,0x3F], // 0x57 'W'
-    [0x63,0x14,0x08,0x14,0x63], // 0x58 'X'
-    [0x07,0x08,0x70,0x08,0x07], // 0x59 'Y'
-    [0x61,0x51,0x49,0x45,0x43], // 0x5A 'Z'
-    [0x00,0x7F,0x41,0x41,0x00], // 0x5B '['
-    [0x02,0x04,0x08,0x10,0x20], // 0x5C '\\'
-    [0x00,0x41,0x41,0x7F,0x00], // 0x5D ']'
-    [0x04,0x02,0x01,0x02,0x04], // 0x5E '^'
-    [0x40,0x40,0x40,0x40,0x40], // 0x5F '_'
-    [0x00,0x01,0x02,0x04,0x00], // 0x60 '`'
-    [0x20,0x54,0x54,0x54,0x78], // 0x61 'a'
-    [0x7F,0x48,0x44,0x44,0x38], // 0x62 'b'
-    [0x38,0x44,0x44,0x44,0x20], // 0x63 'c'
-    [0x38,0x44,0x44,0x48,0x7F], // 0x64 'd'
-    [0x38,0x54,0x54,0x54,0x18], // 0x65 'e'
-    [0x08,0x7E,0x09,0x01,0x02], // 0x66 'f'
-    [0x0C,0x52,0x52,0x52,0x3E], // 0x67 'g'
-    [0x7F,0x08,0x04,0x04,0x78], // 0x68 'h'
-    [0x00,0x44,0x7D,0x40,0x00], // 0x69 'i'
-    [0x20,0x40,0x44,0x3D,0x00], // 0x6A 'j'
-    [0x7F,0x10,0x28,0x44,0x00], // 0x6B 'k'
-    [0x00,0x41,0x7F,0x40,0x00], // 0x6C 'l'
-    [0x7C,0x04,0x18,0x04,0x78], // 0x6D 'm'
-    [0x7C,0x08,0x04,0x04,0x78], // 0x6E 'n'
-    [0x38,0x44,0x44,0x44,0x38], // 0x6F 'o'
-    [0x7C,0x14,0x14,0x14,0x08], // 0x70 'p'
-    [0x08,0x14,0x14,0x18,0x7C], // 0x71 'q'
-    [0x7C,0x08,0x04,0x04,0x08], // 0x72 'r'
-    [0x48,0x54,0x54,0x54,0x20], // 0x73 's'
-    [0x04,0x3F,0x44,0x40,0x20], // 0x74 't'
-    [0x3C,0x40,0x40,0x20,0x7C], // 0x75 'u'
-    [0x1C,0x20,0x40,0x20,0x1C], // 0x76 'v'
-    [0x3C,0x40,0x30,0x40,0x3C], // 0x77 'w'
-    [0x44,0x28,0x10,0x28,0x44], // 0x78 'x'
-    [0x0C,0x50,0x50,0x50,0x3C], // 0x79 'y'
-    [0x44,0x64,0x54,0x4C,0x44], // 0x7A 'z'
-    [0x00,0x08,0x36,0x41,0x00], // 0x7B '{'
-    [0x00,0x00,0x7F,0x00,0x00], // 0x7C '|'
-    [0x00,0x41,0x36,0x08,0x00], // 0x7D '}'
-    [0x08,0x04,0x08,0x10,0x08], // 0x7E '~'
-];
-
-fn font5x7(ch: char) -> Option<[u8; 5]> {
-    let c = ch as u32;
-    if (0x20..=0x7E).contains(&c) {
-        Some(FONT5X7[(c - 0x20) as usize])
-    } else {
-        None
-    }
-}
-
-#[derive(Debug)]
-pub struct Framebuffer {
-    pub width: u32,
-    pub height: u32,
-    /// Host-side RGBA8888 mirror, `width * height * 4` bytes.
-    pub rgba: Vec<u8>,
-}
-
-impl Framebuffer {
-    pub fn new(width: u32, height: u32) -> Self {
-        Self {
-            width,
-            height,
-            rgba: vec![0; (width * height * 4) as usize],
-        }
-    }
-
-    /// Returns the byte offset into `rgba` for `(x, y)`, or `None`
-    /// if out of bounds.
-    fn idx(&self, x: i32, y: i32) -> Option<usize> {
-        if x < 0 || y < 0 {
-            return None;
-        }
-        let (x, y) = (x as u32, y as u32);
-        if x >= self.width || y >= self.height {
-            return None;
-        }
-        Some(((y * self.width + x) * 4) as usize)
-    }
-
-    pub fn put_pixel(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
-        if let Some(i) = self.idx(x, y) {
-            self.rgba[i..i + 4].copy_from_slice(&rgba);
-        }
-    }
-
-    pub fn fill_rect(&mut self, l: i32, t: i32, r: i32, b: i32, rgba: [u8; 4]) {
-        let (l, r) = (l.min(r), l.max(r));
-        let (t, b) = (t.min(b), t.max(b));
-        for y in t..b {
-            for x in l..r {
-                self.put_pixel(x, y, rgba);
-            }
-        }
-    }
-
-    /// Draw a single ASCII character (0x20..=0x7E) at `(x, y)` in
-    /// `rgba`. The cell is 6 pixels wide x 8 pixels tall — a 5x7 glyph
-    /// plus a 1-pixel right gutter and a 1-pixel bottom gutter.
-    /// Non-ASCII / control characters render as a small filled
-    /// square so they remain visible.
-    pub fn draw_char(&mut self, x: i32, y: i32, ch: char, rgba: [u8; 4]) {
-        let glyph: [u8; 5] = match font5x7(ch) {
-            Some(g) => g,
-            None => {
-                // Fallback: small filled square so non-ASCII still
-                // shows up as something.
-                self.fill_rect(x, y, x + 4, y + 6, rgba);
-                return;
-            }
-        };
-        for (col, &bits) in glyph.iter().enumerate() {
-            for row in 0..7i32 {
-                if (bits >> row) & 1 == 1 {
-                    self.put_pixel(x + col as i32, y + row, rgba);
-                }
-            }
-        }
-    }
-
-    /// Render an ASCII / Unicode string at `(x, y)`. Each glyph is
-    /// 6 pixels wide; non-printable / unsupported chars become small
-    /// boxes. Newlines advance one line (8 px).
-    pub fn draw_text(&mut self, x: i32, y: i32, text: &str, rgba: [u8; 4]) {
-        let (mut cx, mut cy) = (x, y);
-        for ch in text.chars() {
-            if ch == '\n' {
-                cx = x;
-                cy += 8;
-                continue;
-            }
-            self.draw_char(cx, cy, ch, rgba);
-            cx += 6;
-        }
-    }
-
-    /// Stroke an outline rectangle (used by GDI `Rectangle`).
-    pub fn stroke_rect(&mut self, l: i32, t: i32, r: i32, b: i32, rgba: [u8; 4]) {
-        let (l, r) = (l.min(r), l.max(r));
-        let (t, b) = (t.min(b), t.max(b));
-        for x in l..r {
-            self.put_pixel(x, t, rgba);
-            self.put_pixel(x, b - 1, rgba);
-        }
-        for y in t..b {
-            self.put_pixel(l, y, rgba);
-            self.put_pixel(r - 1, y, rgba);
-        }
-    }
-
-    /// Convert RGB565 little-endian bytes from the guest into our
-    /// RGBA mirror. `pitch_bytes` is the row pitch in bytes; default
-    /// is `width * 2`.
-    pub fn present_from_rgb565(&mut self, rgb565: &[u8], pitch_bytes: usize) {
-        let pitch = if pitch_bytes == 0 {
-            (self.width * 2) as usize
-        } else {
-            pitch_bytes
-        };
-        for y in 0..self.height as usize {
-            let row = y * pitch;
-            for x in 0..self.width as usize {
-                let off = row + x * 2;
-                if off + 1 >= rgb565.len() {
-                    break;
-                }
-                let lo = rgb565[off];
-                let hi = rgb565[off + 1];
-                let v = u16::from_le_bytes([lo, hi]);
-                let r5 = ((v >> 11) & 0x1f) as u8;
-                let g6 = ((v >> 5) & 0x3f) as u8;
-                let b5 = (v & 0x1f) as u8;
-                let r = (r5 << 3) | (r5 >> 2);
-                let g = (g6 << 2) | (g6 >> 4);
-                let b = (b5 << 3) | (b5 >> 2);
-                let i = (y * self.width as usize + x) * 4;
-                self.rgba[i] = r;
-                self.rgba[i + 1] = g;
-                self.rgba[i + 2] = b;
-                self.rgba[i + 3] = 0xff;
-            }
-        }
-    }
-
-    /// Write the RGBA framebuffer to a PNG file.
-    pub fn write_png(&self, path: &std::path::Path) -> std::io::Result<()> {
-        let file = std::fs::File::create(path)?;
-        let w = std::io::BufWriter::new(file);
-        let mut enc = png::Encoder::new(w, self.width, self.height);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut writer = enc
-            .write_header()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        writer
-            .write_image_data(&self.rgba)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(())
-    }
+    /// `nIDEvent` of the timer the guest most recently registered via
+    /// `SetTimer`, or `0` if none. The synthetic message pump uses
+    /// this to inject `WM_TIMER` messages with a wParam the guest
+    /// will recognise.
+    pub synthetic_timer_id: u32,
+    /// `true` once the synthetic message pump has delivered
+    /// `WM_CREATE`. Real Windows fires `WM_CREATE` synchronously
+    /// from `CreateWindowExW`; we instead fire it on the very first
+    /// `GetMessageW` so the guest's `WndProc` runs its window-init
+    /// code (which typically calls `SetTimer`).
+    pub synthetic_create_sent: bool,
 }
 
 /// One IAT entry that has been resolved to a host-side stub.
@@ -478,6 +204,12 @@ pub struct Heap {
     size: u32,
     /// Sorted by start VA. Each entry is `(start, size)` of free space.
     free: Vec<(u32, u32)>,
+    /// Out-of-band tracker of `(user_ptr -> requested_size)` for every
+    /// outstanding allocation. We keep it host-side so the guest can
+    /// not accidentally corrupt the bookkeeping by writing past its
+    /// own buffer (Pocket PC games do this all the time). It also lets
+    /// `Heap::msize(p)` answer in O(1).
+    live: HashMap<u32, u32>,
 }
 
 const HEAP_HEADER_BYTES: u32 = 8;
@@ -489,6 +221,7 @@ impl Heap {
             base,
             size,
             free: vec![(base, size)],
+            live: HashMap::new(),
         }
     }
 
@@ -515,22 +248,37 @@ impl Heap {
                 } else {
                     self.free[i] = (start + need, sz - need);
                 }
-                return Some(start + HEAP_HEADER_BYTES);
+                let user_ptr = start + HEAP_HEADER_BYTES;
+                self.live.insert(user_ptr, requested);
+                return Some(user_ptr);
             }
         }
         None
     }
 
-    /// Free a previously allocated chunk. The header at `user_ptr - 8`
-    /// stores `(block_start, block_size)`. We trust the caller (the
-    /// guest) — bad frees are logged and ignored.
-    pub fn free(&mut self, user_ptr: u32, recorded_size: u32) {
+    /// Look up the user-requested size of `user_ptr`, or `None` if the
+    /// pointer is not the result of a still-live `Heap::alloc`.
+    pub fn msize(&self, user_ptr: u32) -> Option<u32> {
+        self.live.get(&user_ptr).copied()
+    }
+
+    /// Free a previously allocated chunk. The size is recovered from
+    /// our live-block table; if the caller passes a bogus pointer we
+    /// log and ignore.
+    pub fn free(&mut self, user_ptr: u32) {
+        if user_ptr == 0 {
+            return;
+        }
+        let Some(user_size) = self.live.remove(&user_ptr) else {
+            log::warn!("heap.free: unknown pointer 0x{user_ptr:08x} (double free?)");
+            return;
+        };
         if user_ptr < self.base + HEAP_HEADER_BYTES {
             log::warn!("heap.free: ignoring out-of-range pointer 0x{user_ptr:08x}");
             return;
         }
         let block_start = user_ptr - HEAP_HEADER_BYTES;
-        let block_size = recorded_size + HEAP_HEADER_BYTES;
+        let block_size = Self::align_up(user_size.max(1)) + HEAP_HEADER_BYTES;
         if block_start + block_size > self.base + self.size {
             log::warn!("heap.free: chunk overflows heap; ignoring");
             return;
@@ -649,33 +397,16 @@ impl Process {
             trap_page.extend_from_slice(&ARM_BX_LR);
         }
         cpu.write_mem(KERNEL_TRAP_BASE, &trap_page)?;
+        // Install a halt-on-hit watch on the well-known terminate
+        // syscalls reached via the MS CRT __doexit path. Without
+        // this, the guest's ExitProcess returns through `bx lr`
+        // back into a poisoned LR / popped 0 → bogus null deref.
+        for &exit_va in &[0xF000_F7F8u32, 0xF000_F7FCu32, 0xF000_FFFCu32] {
+            cpu.add_code_hook(exit_va)?;
+        }
 
-        // 6. Map the 240x320 RGB565 framebuffer GAPI hands the game.
-        cpu.map_region(FRAMEBUFFER_BASE, FRAMEBUFFER_SIZE, Prot::READ | Prot::WRITE)?;
-
-        // 7. Map a one-page trampoline-return stub. When the
-        //    dispatcher trampolines guest code into a WNDPROC it
-        //    sets LR to this address; the page is filled with bx lr
-        //    and the run loop installs a code hook so we land back
-        //    in the dispatcher with whatever R0 the WNDPROC returned.
-        cpu.map_region(TRAMPOLINE_RETURN_VA, 0x1000, Prot::READ | Prot::EXEC)?;
-        cpu.write_mem(TRAMPOLINE_RETURN_VA, &ARM_BX_LR)?;
-        cpu.add_code_hook(TRAMPOLINE_RETURN_VA)?;
-
-        // 8a. Map a writable region at the synthetic HMODULE address.
-        //     Games sometimes treat the HMODULE returned from
-        //     LoadLibraryW as a struct pointer (e.g. patching a
-        //     function-pointer slot at `(handle + 0xb0)`). Without
-        //     this page they fault on the write.
-        cpu.map_region(FAKE_MODULE_BASE, FAKE_MODULE_SIZE, Prot::READ | Prot::WRITE)?;
-
-        // 8. Map a zeroed scratch page used as a "safe pointer" for
-        //    unimplemented APIs. Reading from it returns 0; writing to
-        //    it is harmless (and ignored by callers). Many WinCE
-        //    games fetch a struct via an API and then deref it
-        //    immediately; without this page they would NULL-deref.
-        cpu.map_region(SCRATCH_PAGE_VA, SCRATCH_PAGE_SIZE, Prot::READ | Prot::WRITE)?;
-
+        let resources = image.resources.clone();
+        let img_base = image.image_base;
         Ok(Process {
             image,
             thunks,
@@ -685,9 +416,16 @@ impl Process {
             state: KernelState {
                 heap,
                 vfs: vfs::Vfs::new(),
-                fb: Framebuffer::new(FB_WIDTH, FB_HEIGHT),
+                framebuffer: Framebuffer::default(),
+                gdi: GdiState::new(),
+                resources,
+                image_base: img_base,
+                fb_mapped: false,
+                synthetic_message_count: 0,
+                synthetic_message_budget: 240,
                 wnd_proc: 0,
-                message_phase: 0,
+                synthetic_timer_id: 0,
+                synthetic_create_sent: false,
             },
         })
     }
@@ -710,6 +448,30 @@ impl Process {
     }
 }
 
+/// Returned from a [`FrameHook`] to indicate whether emulation
+/// should continue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameAction {
+    Continue,
+    Stop,
+}
+
+/// Callback that observes the framebuffer between dispatch slices.
+/// Used by the host-side frontend to display the rendered frame and
+/// pump window events.
+pub trait FrameHook {
+    /// Called between dispatcher slices. The hook receives the
+    /// kernel state — typically the framebuffer — and returns
+    /// whether emulation should keep running.
+    fn on_frame(&mut self, state: &KernelState) -> FrameAction;
+}
+
+impl<F: FnMut(&KernelState) -> FrameAction> FrameHook for F {
+    fn on_frame(&mut self, state: &KernelState) -> FrameAction {
+        self(state)
+    }
+}
+
 /// Drive emulated execution in a loop, dispatching each thunk hit
 /// through `dispatcher` until a [`DispatchOutcome::Halt`] is returned
 /// or the configured instruction budget is exhausted.
@@ -720,7 +482,39 @@ pub fn run_main_loop(
     instruction_budget_per_slice: u64,
     max_slices: u64,
 ) -> Result<(), KernelError> {
-    let mut pc = process.image.entry_va();
+    run_main_loop_with_hook(
+        cpu,
+        process,
+        dispatcher,
+        instruction_budget_per_slice,
+        max_slices,
+        None,
+    )
+}
+
+/// Same as [`run_main_loop`], but also calls `frame_hook` between
+/// each slice so the host-side window can repaint and pump events.
+pub fn run_main_loop_with_hook(
+    cpu: &mut dyn Cpu,
+    process: &mut Process,
+    dispatcher: &mut dyn Dispatcher,
+    instruction_budget_per_slice: u64,
+    max_slices: u64,
+    mut frame_hook: Option<&mut dyn FrameHook>,
+) -> Result<(), KernelError> {
+    let mut pc = match std::env::var("POCKETHLE_OVERRIDE_ENTRY") {
+        Ok(v) => {
+            let parsed = if let Some(stripped) = v.strip_prefix("0x") {
+                u32::from_str_radix(stripped, 16)
+            } else {
+                v.parse::<u32>()
+            }
+            .map_err(|_| KernelError::Loader("invalid POCKETHLE_OVERRIDE_ENTRY".into()))?;
+            log::info!("POCKETHLE_OVERRIDE_ENTRY=0x{parsed:08x}");
+            parsed
+        }
+        Err(_) => process.image.entry_va(),
+    };
     log::info!(
         "entering emulated main: entry=0x{:08x}, stack_top=0x{:08x}",
         pc,
@@ -734,6 +528,21 @@ pub fn run_main_loop(
     let mut last_resume_pc: u32 = 0;
     let mut stall_count: u32 = 0;
     for _slice in 0..max_slices {
+        // PC=0 (or any address in the unmapped null page) means
+        // the guest jumped through a null function pointer or popped
+        // a poisoned LR off the stack. Without an explicit halt,
+        // unicorn's `emu_start` typically returns `Ok(0 instructions)`
+        // and we'd spin forever. Surface it as a real crash with the
+        // CPU dump.
+        if pc < 0x1000 {
+            log::error!(
+                "guest jumped to NULL/low address pc=0x{pc:08x}\n{regs}",
+                regs = dump_regs(cpu),
+            );
+            return Err(KernelError::Loader(format!(
+                "guest jumped to unmapped address 0x{pc:08x}"
+            )));
+        }
         let stop = match cpu.run_until_hook(pc, instruction_budget_per_slice) {
             Ok(s) => s,
             Err(e) => {
@@ -778,58 +587,63 @@ pub fn run_main_loop(
                 continue;
             }
             StopReason::Hook(addr) => {
-                // The trampoline-return sentinel is never an IAT
-                // thunk; treat it as "the inner WndProc returned —
-                // resume the outer call site".
-                if addr == TRAMPOLINE_RETURN_VA {
-                    let lr = cpu.read_reg(ArmReg::Lr)?;
-                    log::trace!("trampoline return; resuming at lr=0x{lr:08x}");
-                    pc = lr & !1;
-                    continue;
-                }
-                let thunk = {
-                    let t = process.find_thunk(addr).ok_or_else(|| {
-                        KernelError::Dispatch(format!("hook fired at unmapped 0x{addr:08x}"))
-                    })?;
-                    t.clone()
+                let thunk = match process.find_thunk(addr) {
+                    Some(t) => t.clone(),
+                    None => {
+                        // A `--watch` breakpoint or other non-thunk
+                        // code hook was hit. Dump CPU state for the
+                        // diagnostic and HALT — otherwise unicorn
+                        // would re-fire the hook on resume and we'd
+                        // spin forever.
+                        log::warn!("watch hit at 0x{addr:08x}\n{regs}", regs = dump_regs(cpu),);
+                        return Ok(());
+                    }
                 };
                 let outcome = dispatcher.dispatch(cpu, &thunk, &mut process.state)?;
-                let r0_default = match outcome {
+                match outcome {
                     DispatchOutcome::Halt => {
                         log::info!("dispatcher requested halt at {}", thunk.label());
                         return Ok(());
                     }
-                    DispatchOutcome::ReturnedR0(v) => Some((v, None)),
-                    DispatchOutcome::ReturnedR0R1(a, b) => Some((a, Some(b))),
-                    // For unknown ordinals, return a pre-mapped
-                    // zero-page address. Games that use the result as
-                    // a BOOL see a non-zero (so "success"); games that
-                    // dereference it as a handle/struct see zeros.
-                    DispatchOutcome::Unimplemented => Some((SCRATCH_PAGE_VA, None)),
-                    DispatchOutcome::Trampoline { target, lr, args } => {
-                        cpu.write_reg(ArmReg::R0, args[0])?;
-                        cpu.write_reg(ArmReg::R1, args[1])?;
-                        cpu.write_reg(ArmReg::R2, args[2])?;
-                        cpu.write_reg(ArmReg::R3, args[3])?;
-                        cpu.write_reg(ArmReg::Lr, lr)?;
-                        log::trace!("trampoline -> 0x{target:08x} lr=0x{lr:08x} args={args:?}");
-                        pc = target & !1;
-                        continue;
+                    DispatchOutcome::ReturnedR0(v) => {
+                        cpu.write_reg(ArmReg::R0, v)?;
+                        let lr = cpu.read_reg(ArmReg::Lr)?;
+                        pc = lr & !1;
                     }
-                };
-                if let Some((v, maybe_hi)) = r0_default {
-                    cpu.write_reg(ArmReg::R0, v)?;
-                    if let Some(hi) = maybe_hi {
-                        cpu.write_reg(ArmReg::R1, hi)?;
+                    DispatchOutcome::ReturnedR0R1(a, b) => {
+                        cpu.write_reg(ArmReg::R0, a)?;
+                        cpu.write_reg(ArmReg::R1, b)?;
+                        let lr = cpu.read_reg(ArmReg::Lr)?;
+                        pc = lr & !1;
+                    }
+                    DispatchOutcome::Unimplemented => {
+                        cpu.write_reg(ArmReg::R0, 0)?;
+                        let lr = cpu.read_reg(ArmReg::Lr)?;
+                        pc = lr & !1;
+                    }
+                    DispatchOutcome::JumpTo(target) => {
+                        // Trampoline into a guest function — `target` is
+                        // the new PC, the handler is responsible for
+                        // setting LR / R0..R3 / SP appropriately.
+                        pc = target & !1;
                     }
                 }
-                let lr = cpu.read_reg(ArmReg::Lr)?;
-                pc = lr & !1; // strip Thumb bit
             }
             StopReason::Requested | StopReason::OutOfBounds => return Ok(()),
         }
+        if let Some(hook) = frame_hook.as_deref_mut() {
+            if hook.on_frame(&process.state) == FrameAction::Stop {
+                log::info!("frame hook requested stop");
+                return Ok(());
+            }
+        }
     }
-    log::warn!("main loop hit max_slices={max_slices}; exiting");
+    let pc_now = cpu.read_reg(ArmReg::Pc).unwrap_or(0);
+    log::warn!(
+        "main loop hit max_slices={max_slices}; exiting at pc=0x{pc_now:08x}\n{regs}{mem}",
+        regs = dump_regs(cpu),
+        mem = dump_mem_around(cpu, pc_now, 16),
+    );
     Ok(())
 }
 
@@ -847,8 +661,10 @@ mod tests {
         let b = h.alloc(128).unwrap();
         assert!(b > a);
         assert!(h.free_bytes() < initial_free);
-        h.free(a, 64);
-        h.free(b, 128);
+        assert_eq!(h.msize(a), Some(64));
+        assert_eq!(h.msize(b), Some(128));
+        h.free(a);
+        h.free(b);
         // After freeing both, the heap should be fully coalesced.
         assert_eq!(h.free_bytes(), initial_free);
     }
@@ -888,6 +704,7 @@ mod tests {
             }],
             imports: vec![],
             exports: IndexMap::new(),
+            resources: vec![],
         };
         let mut cpu = StubCpu::new();
         let p = Process::map_into(img, &mut cpu, &|_, _| None).unwrap();

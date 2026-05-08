@@ -13,12 +13,11 @@ use crate::{CallCtx, WinCeDispatcher};
 
 pub fn register(d: &mut WinCeDispatcher) {
     let dll = "hss.dll";
-    // C++ constructors / destructors on the MS ARM ABI take `this`
-    // in r0 and must return it back in r0 — otherwise the caller
-    // walks off with a 1 (or 0) pointer and trashes everything it
-    // touches. List them separately so we can hand the right
-    // handler to each.
-    let ctor_dtors = [
+    // C++ ctors/dtors and member functions on the ARM ABI receive
+    // `this` in R0 and (for ctors) must return it. Returning a fixed
+    // `1` makes the caller treat `1` as a valid object pointer and
+    // it then dereferences it on the next instruction.
+    let identity_stubs = [
         "??0hssSound@@QAA@XZ",
         "??1hssSound@@UAA@XZ",
         "??0hssMusic@@QAA@XZ",
@@ -26,14 +25,10 @@ pub fn register(d: &mut WinCeDispatcher) {
         "??0hssSpeaker@@QAA@XZ",
         "??1hssSpeaker@@UAA@XZ",
     ];
-    for f in ctor_dtors {
-        d.register_handler(dll, f, ctor_dtor_passthrough);
+    for f in identity_stubs {
+        d.register_handler(dll, f, this_returning);
     }
-    // Member functions: they all return success or a generic
-    // non-zero handle. C++ member fns also take `this` in r0 but
-    // they have a normal int/handle/HRESULT return value, so we
-    // can keep returning 1 here.
-    let stubs = [
+    let success_stubs = [
         "?volume@hssSound@@QAAXI@Z",
         "?loop@hssSound@@QAAX_N@Z",
         "?load@hssSound@@QAAHPBG@Z",
@@ -50,7 +45,7 @@ pub fn register(d: &mut WinCeDispatcher) {
         "?playSound@hssSpeaker@@QAAHPAVhssSound@@I@Z",
         "?playMusic@hssSpeaker@@QAAHPAVhssMusic@@I@Z",
     ];
-    for f in stubs {
+    for f in success_stubs {
         d.register_handler(dll, f, ok);
     }
 }
@@ -67,4 +62,17 @@ fn ctor_dtor_passthrough(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, Kerne
 
 fn ok(_ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
     Ok(DispatchOutcome::ReturnedR0(1))
+}
+
+/// Constructor stub: zeroes out a small block at `this` (so the
+/// caller's object isn't full of stack garbage) and returns `this`.
+fn this_returning(ctx: &mut CallCtx<'_>) -> Result<DispatchOutcome, KernelError> {
+    let this_ptr = ctx.arg_u32(0)?;
+    if this_ptr != 0 {
+        let zeroes = [0u8; 256];
+        // Best-effort: if `this` lands in unmapped territory we just
+        // skip — the constructor is a no-op anyway in that case.
+        let _ = ctx.cpu.write_mem(this_ptr, &zeroes);
+    }
+    Ok(DispatchOutcome::ReturnedR0(this_ptr))
 }

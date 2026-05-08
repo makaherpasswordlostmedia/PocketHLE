@@ -178,6 +178,7 @@ impl Dispatcher for WinCeDispatcher {
                 Ok(DispatchOutcome::Trampoline { target, .. }) => (*target, "trampoline"),
                 Ok(DispatchOutcome::Halt) => (0, "halt"),
                 Ok(DispatchOutcome::Unimplemented) => (0, "unimplemented"),
+                Ok(DispatchOutcome::JumpTo(pc)) => (*pc, "trampoline"),
                 Err(_) => (0, "error"),
             };
             let line = format!(

@@ -14,10 +14,12 @@ The first target ROM is a small physics game called **JumpyBall** (provided
 by the user, ARM PE32, Windows CE 5 GUI). All work is driven from the public
 APIs that this game uses.
 
-> **Status:** early — the ARM CPU runs, the loader works, system-DLL imports
-> are intercepted and traced, and a handful of `coredll` functions are
-> implemented (`memcpy`, `memset`, `GetTickCount`, ...). There is no rendering
-> backend yet. See [Roadmap](#roadmap).
+> **Status:** early but visibly working — the ARM CPU runs, the loader
+> works, system-DLL imports are intercepted, a software-rasterised
+> framebuffer is wired through GDI/GAPI, and JumpyBall reaches its
+> main menu and credits screen out of the box (`pockethle run
+> JumpyBallPPC.cab`). See [Roadmap](#roadmap) for what is still
+> stubbed.
 
 [Russian (Русский) version → `README.ru.md`](README.ru.md)
 
@@ -28,8 +30,10 @@ APIs that this game uses.
 - [Features](#features)
 - [Architecture](#architecture)
 - [Building on Linux](#building-on-linux)
-- [Trying it on the JumpyBall test ROM](#trying-it-on-the-jumpyball-test-rom)
+- [Building on Windows](#building-on-windows)
 - [Building for Android](#building-for-android)
+- [Trying it on the JumpyBall test ROM](#trying-it-on-the-jumpyball-test-rom)
+- [Library layout](#library-layout)
 - [Roadmap](#roadmap)
 - [Project layout](#project-layout)
 - [Comparison to other emulators](#comparison-to-other-emulators)
@@ -55,8 +59,14 @@ APIs that this game uses.
   automatically so logs say `PeekMessageW` instead of `ord 266`.
 - **Linux CLI frontend** with `pe-info`, `unpack-cab`, `inspect-cab` and
   `run` subcommands.
-- **Android skeleton** — Gradle project that consumes the emulator core via
-  cargo-ndk + JNI (`SurfaceView`-based UI is a TODO).
+- **Cross-platform desktop GUI** — `pocket-desktop` (egui) for Linux & Windows.
+  Library / import / settings screens inspired by
+  [j2me-loader](https://github.com/nikita36078/j2me-loader).
+- **Android launcher** — Gradle project with a j2me-loader-style RecyclerView,
+  per-game settings, FAB import, and a `SurfaceView`-based game screen.
+- **Cross-platform CI** — GitHub Actions builds release artifacts for Linux
+  (`tar.gz`), Windows (`zip`) and Android (`apk`) on every push, the way
+  [touchHLE](https://github.com/touchHLE/touchHLE) does.
 
 ## Architecture
 
@@ -102,46 +112,103 @@ Foundation, just adapted to Win32-style import tables.
 rustup default stable               # 1.85+ recommended
 
 # 2. Native deps (Ubuntu / Debian)
-sudo apt install -y cmake build-essential pkg-config libclang-dev
+sudo apt install -y cmake build-essential pkg-config libclang-dev \
+                    libgtk-3-dev libxkbcommon-dev \
+                    libwayland-dev libx11-dev libxcb1-dev \
+                    libxrandr-dev libxinerama-dev libxi-dev \
+                    libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev
 
 # 3. Build everything (stub CPU only — fast, ~30 s)
 cargo build --release --workspace
 
 # 4. Build the CLI with the real ARM CPU backend (~3 minutes first time;
 #    Unicorn Engine is built from source).
-cargo build --release -p pocket-cli --features unicorn
+cargo build --release -p pocket-cli      --features unicorn
+cargo build --release -p pocket-desktop  --features unicorn
 
 # 5. Run tests
 cargo test --workspace
 ```
 
-The resulting binary lives at `target/release/pockethle`.
+The resulting binaries live at:
+
+- `target/release/pockethle`     — CLI (`pe-info`, `unpack-cab`, `inspect-cab`, `run`, ...)
+- `target/release/pockethle-gui` — desktop GUI (`pocket-desktop`)
+
+## Building on Windows
+
+PocketHLE builds out of the box on Windows with the MSVC toolchain (the same
+way touchHLE distributes its Windows build).
+
+```powershell
+# 1. Install rustup, then:
+rustup default stable-x86_64-pc-windows-msvc
+
+# 2. Build CLI + desktop GUI (stub CPU — fast)
+cargo build --release -p pocket-cli
+cargo build --release -p pocket-desktop
+
+# 3. (Optional) Real ARM CPU via Unicorn Engine — needs cmake on PATH
+#    and a working MSVC C/C++ toolchain. Building Unicorn from source the
+#    first time takes a few minutes.
+cargo build --release -p pocket-cli      --features unicorn
+cargo build --release -p pocket-desktop  --features unicorn
+```
+
+The resulting binaries are `target\release\pockethle.exe` and
+`target\release\pockethle-gui.exe`.
+
+Double-clicking `pockethle-gui.exe` opens a small launcher window: import a
+`.CAB`, pick a game from the library, hit Run.
 
 ## Trying it on the JumpyBall test ROM
 
+The `run` subcommand accepts a Pocket PC `.exe`, a `.cab`, or a
+`.zip` directly — archives are auto-extracted into a temp dir and the
+largest ARM PE inside is launched. The default build of `pockethle`
+includes both the `unicorn` CPU and the `display` host-window
+features so a freshly-checked-out repo can render a game without
+extra flags.
+
 ```bash
-# Inspect a CAB without unpacking permanently
+# (a) Run from the original Microsoft cabinet — auto-extracts and
+#     auto-mounts the cabinet contents at the guest's `\Application\`
+#     so CreateFileW finds the bundled resources.
+pockethle run ~/JumpyBallPPC.cab
+
+# (b) Same, but pop a host window with the live framebuffer.
+pockethle run ~/JumpyBallPPC.cab --display
+
+# (c) Headless capture: dump every rendered frame as PPM and stop
+#     after eight frames — useful for CI / regression diffs.
+pockethle run ~/JumpyBallPPC.cab \
+    --dump-frames-to /tmp/jumpy_frames --max-frames 8
+
+# (d) The classic flow is still supported if you want to inspect
+#     things by hand:
 pockethle inspect-cab ~/JumpyBallPPC.cab
-
-# Or unpack manually first:
-pockethle unpack-cab ~/JumpyBallPPC.cab /tmp/jumpy
+pockethle unpack-cab  ~/JumpyBallPPC.cab /tmp/jumpy
 pockethle pe-info     /tmp/jumpy/JUMPYB~1.002
+pockethle run         /tmp/jumpy/JUMPYB~1.002
 
-# Run the game (CPU = unicorn). Without the feature flag, the run
-# subcommand still loads the PE and prints the import table, but does
-# not interpret any instructions.
-pockethle -v run /tmp/jumpy/JUMPYB~1.002 \
-    --cpu unicorn \
-    --max-slices 200 --instructions-per-slice 100000
+# (e) For trace-only analysis (no real CPU), pass `--cpu stub`. This
+#     does not require the Unicorn build.
+pockethle run ~/JumpyBallPPC.cab --cpu stub --max-slices 1
 ```
 
-The first time you run this, expect to see lines like:
+Real PPC2003 games typically need a few hundred thousand emulated
+slices to finish their CRT init, build their soft-float lookup
+tables and load bitmap resources before the first `WM_PAINT` is
+delivered. `pockethle run` therefore defaults to `--max-slices
+2_000_000`; pass a smaller value for fast smoke tests, or `0` for no
+upper bound.
+
+The first time you run an unfamiliar binary, expect to see lines
+like:
 
 ```
 [INFO  pocket_kernel] entering emulated main: entry=0x000247c8, stack_top=0x60000000
-[WARN  pocket_winceapi] unimplemented call -> COREDLL.dll!__chkstk
 [WARN  pocket_winceapi] unimplemented call -> COREDLL.dll!CreateDirectoryW
-[WARN  pocket_winceapi] unimplemented call -> COREDLL.dll!Rectangle
 ...
 ```
 
@@ -161,18 +228,53 @@ It depends on:
 Build:
 
 ```bash
-# From the repo root, cross-compile the core for the four
-# Android ABIs we ship (arm64-v8a is the realistic target).
-cargo ndk -t arm64-v8a -t armeabi-v7a -o frontends/pocket-android/app/src/main/jniLibs \
-    build --release -p pocket-cli
+# 1. Cross-compile the JNI bridge for the two Android ABIs we ship.
+cargo ndk \
+    -t arm64-v8a \
+    -t armeabi-v7a \
+    -o frontends/pocket-android/app/src/main/jniLibs \
+    build --release -p pocket-android-jni
 
-# Then open frontends/pocket-android in Android Studio and run on a
-# device or emulator.
+# 2. Build the APK (uses the Gradle wrapper).
+cd frontends/pocket-android
+./gradlew assembleRelease
 ```
 
-> The Android UI is currently a stub `MainActivity` that just calls into
-> JNI to print the emulator's banner. A real `SurfaceView`-backed render
-> loop is on the roadmap.
+The APK lands in
+`frontends/pocket-android/app/build/outputs/apk/release/`.
+
+The Android UI is modelled on
+[j2me-loader](https://github.com/nikita36078/j2me-loader): a RecyclerView
+launcher with per-game cards (Run / Settings / Remove), a FAB to import
+new `.CAB` files via the system file picker, a global settings screen
+(default CPU backend, log verbosity), and a per-game settings screen
+(CPU backend, dispatch slice budget, halt-on-unimplemented). Running a
+game opens a `SurfaceView`-backed `GameActivity` that displays the
+emulator's framebuffer.
+
+## Library layout
+
+The desktop GUI and the Android launcher share an on-disk library managed
+by the [`pocket-library`](crates/pocket-library) crate. It looks like
+this:
+
+```
+<library-root>/
+├── library.json          # index of imported games
+├── config.json           # default CPU backend, log verbosity, ...
+└── games/
+    └── <sanitized-id>/
+        ├── game.json     # display name, source CAB, per-game settings
+        ├── source.cab    # original archive (kept for re-extraction)
+        └── extracted/
+            └── ... PE / data files ...
+```
+
+On Linux/Windows the default root is
+`~/.local/share/PocketHLE/library` (or platform equivalent via
+[`directories`](https://docs.rs/directories)).
+On Android it lives under the app's external files dir,
+`getExternalFilesDir(null)/library`.
 
 ## Roadmap
 
@@ -207,9 +309,12 @@ crates/
   pocket-kernel/     Address space, IAT thunks, dispatcher loop
   pocket-winceapi/   coredll / aygshell / gx (GAPI) / hss handlers
   pocket-core/       Top-level Emulator that frontends drive
+  pocket-library/    On-disk game library + per-game config (shared by GUIs)
 frontends/
-  pocket-cli/        Linux command-line tool (`pockethle`)
-  pocket-android/    Gradle project that wraps the core via JNI
+  pocket-cli/        Cross-platform command-line tool (`pockethle`)
+  pocket-desktop/    Cross-platform egui GUI for Linux & Windows (`pockethle-gui`)
+  pocket-android-jni/Rust JNI bridge consumed by the Android app
+  pocket-android/    Gradle project (Kotlin) — j2me-loader-style launcher
 data/
   ordinals/          JSON ordinal -> name maps for coredll, aygshell
 docs/
